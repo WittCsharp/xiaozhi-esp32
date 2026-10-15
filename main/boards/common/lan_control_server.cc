@@ -1,6 +1,7 @@
 #include "lan_control_server.h"
 
 #include "application.h"
+#include "body_bridge.h"
 #include "cjson_utils.h"
 #include "device_state_machine.h"
 #include "lan_control_util.h"
@@ -316,7 +317,106 @@ esp_err_t HealthHandler(httpd_req_t* req) {
     cJSON_AddStringToObject(root.get(), "state", DeviceStateMachine::GetStateName(state));
     cJSON_AddStringToObject(root.get(), "ip", ip.c_str());
     cJSON_AddNumberToObject(root.get(), "port", CONFIG_LAN_CONTROL_API_PORT);
+    cJSON_AddBoolToObject(root.get(), "body_mode", body_bridge::Enabled());
+    cJSON_AddStringToObject(root.get(), "bridge",
+                            body_bridge::BridgeConfigured() ? "configured" : "missing");
     return SendJson(req, "200 OK", root.get());
+}
+
+esp_err_t SendModeStatus(httpd_req_t* req) {
+    CJsonUniquePtr root(cJSON_CreateObject());
+    if (!root) {
+        return SendJson(req, "500 Internal Server Error", nullptr);
+    }
+    cJSON_AddBoolToObject(root.get(), "ok", true);
+    cJSON_AddBoolToObject(root.get(), "body_mode", body_bridge::Enabled());
+    cJSON_AddStringToObject(root.get(), "bridge",
+                            body_bridge::BridgeConfigured() ? "configured" : "missing");
+    return SendJson(req, "200 OK", root.get());
+}
+
+esp_err_t SendBridgeStatus(httpd_req_t* req) {
+    CJsonUniquePtr root(cJSON_CreateObject());
+    if (!root) {
+        return SendJson(req, "500 Internal Server Error", nullptr);
+    }
+    const std::string url = body_bridge::BridgeUrl();
+    cJSON_AddBoolToObject(root.get(), "ok", true);
+    cJSON_AddStringToObject(root.get(), "bridge", url.empty() ? "missing" : "configured");
+    cJSON_AddStringToObject(root.get(), "url", url.c_str());
+    cJSON_AddBoolToObject(root.get(), "token_set", body_bridge::TokenConfigured());
+    return SendJson(req, "200 OK", root.get());
+}
+
+esp_err_t ModeGetHandler(httpd_req_t* req) {
+    esp_err_t result = ESP_OK;
+    if (!RejectUnlessAuthorized(req, result)) {
+        return result;
+    }
+    return SendModeStatus(req);
+}
+
+esp_err_t ModePostHandler(httpd_req_t* req) {
+    esp_err_t result = ESP_OK;
+    CJsonUniquePtr root;
+    if (!RequireJson(req, root, result)) {
+        return result;
+    }
+    cJSON* body = cJSON_GetObjectItem(root.get(), "body");
+    if (!cJSON_IsBool(body)) {
+        return SendError(req, "400 Bad Request", "invalid_mode");
+    }
+    const bool enable = cJSON_IsTrue(body);
+    const bool capturing = body_bridge::Session::GetInstance().IsCapturing();
+    body_bridge::SetEnabled(enable);
+    if (!enable && capturing) {
+        Application::GetInstance().Schedule([]() { Application::GetInstance().StopListening(); });
+    }
+    return SendModeStatus(req);
+}
+
+esp_err_t BridgeGetHandler(httpd_req_t* req) {
+    esp_err_t result = ESP_OK;
+    if (!RejectUnlessAuthorized(req, result)) {
+        return result;
+    }
+    return SendBridgeStatus(req);
+}
+
+esp_err_t BridgePostHandler(httpd_req_t* req) {
+    esp_err_t result = ESP_OK;
+    CJsonUniquePtr root;
+    if (!RequireJson(req, root, result)) {
+        return result;
+    }
+    cJSON* url_item = cJSON_GetObjectItem(root.get(), "url");
+    cJSON* token_item = cJSON_GetObjectItem(root.get(), "token");
+    if (url_item == nullptr && token_item == nullptr) {
+        return SendError(req, "400 Bad Request", "invalid_bridge");
+    }
+
+    std::string url = body_bridge::BridgeUrl();
+    if (url_item != nullptr) {
+        if (!CopyJsonString(url_item, url, lan_control::kMaxBridgeUrlLen, true) ||
+            (!url.empty() && !lan_control::IsBridgeUrl(url))) {
+            return SendError(req, "400 Bad Request", "invalid_bridge");
+        }
+    }
+
+    const std::string* token_ptr = nullptr;
+    std::string token;
+    if (token_item != nullptr) {
+        if (!CopyJsonString(token_item, token, lan_control::kMaxTokenLen, true) ||
+            !lan_control::IsBridgeToken(token)) {
+            return SendError(req, "400 Bad Request", "invalid_bridge");
+        }
+        token_ptr = &token;
+    }
+
+    if (!body_bridge::SetBridge(url, token_ptr)) {
+        return SendError(req, "400 Bad Request", "invalid_bridge");
+    }
+    return SendBridgeStatus(req);
 }
 
 esp_err_t NotifyHandler(httpd_req_t* req) {
@@ -484,7 +584,7 @@ void LanControlServer::Listen() {
     config.max_open_sockets = 3;
     config.lru_purge_enable = true;
     config.stack_size = 8192;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 12;
 
     httpd_handle_t server = nullptr;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -495,7 +595,11 @@ void LanControlServer::Listen() {
     const bool registered = RegisterRoute(server, "/api/health", HTTP_GET, HealthHandler) &&
                             RegisterRoute(server, "/api/notify", HTTP_POST, NotifyHandler) &&
                             RegisterRoute(server, "/api/alert", HTTP_POST, AlertHandler) &&
-                            RegisterRoute(server, "/api/servo", HTTP_POST, ServoHandler);
+                            RegisterRoute(server, "/api/servo", HTTP_POST, ServoHandler) &&
+                            RegisterRoute(server, "/api/mode", HTTP_GET, ModeGetHandler) &&
+                            RegisterRoute(server, "/api/mode", HTTP_POST, ModePostHandler) &&
+                            RegisterRoute(server, "/api/bridge", HTTP_GET, BridgeGetHandler) &&
+                            RegisterRoute(server, "/api/bridge", HTTP_POST, BridgePostHandler);
     if (!registered) {
         httpd_stop(server);
         ESP_LOGE(TAG, "Failed to register LAN control routes");

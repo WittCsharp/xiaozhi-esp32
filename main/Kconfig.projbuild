@@ -1206,6 +1206,16 @@ menu "LAN Control API"
             empty to refuse every request until a token is stored. Use a long
             random secret of at most 128 characters. Send it as
             "Authorization: Bearer <token>".
+
+    config BODY_MODE_DEFAULT
+        bool "Start in body mode when NVS has no value"
+        depends on LAN_CONTROL_API
+        default n
+        help
+            Body mode makes BOOT and wake skip the cloud chat channel and
+            POST mic audio to the Mac bridge instead. NVS namespace "lan_api",
+            key "body_mode", overrides this after the first /api/mode call.
+            Leave this off so cloud chat stays the default.
 endmenu
 
 endmenu

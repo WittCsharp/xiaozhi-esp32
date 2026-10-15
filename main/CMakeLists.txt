@@ -1120,7 +1120,7 @@ if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD)
     )
 endif()
 if(CONFIG_LAN_CONTROL_API)
-    list(APPEND SOURCES "boards/common/lan_control_server.cc")
+    list(APPEND SOURCES "boards/common/lan_control_server.cc" "boards/common/body_bridge.cc")
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_http_server)
 endif()
 idf_component_register(SRCS ${SOURCES}

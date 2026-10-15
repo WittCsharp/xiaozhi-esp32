@@ -176,6 +176,12 @@ private:
     void HandleNetworkDisconnectedEvent();
     void HandleActivationDoneEvent();
     void HandleWakeWordDetectedEvent();
+#if CONFIG_LAN_CONTROL_API
+    void HandleBodyWakeWord();
+    void BeginBodyListen(const char* source);
+    void EndBodyListen(const char* reason);
+    bool RouteBodyUplink();
+#endif
     void ContinueOpenAudioChannel(ListeningMode mode);
     void BeginWakeWordInvoke(const std::string& wake_word);
     void ContinueWakeWordInvoke(const std::string& wake_word);
