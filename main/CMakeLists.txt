@@ -1119,6 +1119,10 @@ if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD)
         sdmmc
     )
 endif()
+if(CONFIG_LAN_CONTROL_API)
+    list(APPEND SOURCES "boards/common/lan_control_server.cc")
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_http_server)
+endif()
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}

@@ -1179,6 +1179,13 @@ void Application::ConfigureWakeWordForListening() {
 #endif
 }
 
+void Application::EnqueueNotification(std::string audio_url,
+                                      std::vector<NotifySubtitle> subtitles) {
+    Schedule([this, audio_url = std::move(audio_url), subtitles = std::move(subtitles)]() mutable {
+        StartNotification(std::move(audio_url), std::move(subtitles));
+    });
+}
+
 void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
     if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
         ESP_LOGW(TAG, "Ignoring notify message while device is busy");
