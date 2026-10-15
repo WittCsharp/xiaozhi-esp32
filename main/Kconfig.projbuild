@@ -1173,4 +1173,39 @@ menu "TAIJIPAI_S3_CONFIG"
         启动双声道
 endmenu
 
+menu "LAN Control API"
+    config LAN_CONTROL_API
+        bool "Enable LAN HTTP control API"
+        default n
+        help
+            After Wi-Fi associates, listen on the local network so a computer
+            can play a notification and set the on-screen alert. The computer
+            hosts a mono Ogg Opus file. The device plays that URL with
+            Application::StartNotification. This does not add onboard TTS and
+            does not change the cloud WebSocket or MQTT connection.
+
+            The listener is LAN-only and has no TLS. Do not forward the port
+            to the internet. Requests without the bearer token are refused.
+
+    config LAN_CONTROL_API_PORT
+        int "Listen port"
+        depends on LAN_CONTROL_API
+        default 8080
+        range 1 65535
+        help
+            TCP port for the LAN control API. 8080 is also used by the Otto
+            robot WebSocket server; do not enable both on that board.
+
+    config LAN_CONTROL_API_TOKEN
+        string "Default bearer token"
+        depends on LAN_CONTROL_API
+        default ""
+        help
+            Compiled Authorization bearer token. NVS namespace "lan_api", key
+            "token", overrides it and is read on each request. Leave this
+            empty to refuse every request until a token is stored. Use a long
+            random secret of at most 128 characters. Send it as
+            "Authorization: Bearer <token>".
+endmenu
+
 endmenu

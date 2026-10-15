@@ -2,6 +2,8 @@
 
 The `notify` message lets the cloud play a one-way voice notification while a device is idle. It does not open a conversation audio channel and never enables microphone uplink. Starting a conversation still requires an explicit wake action from the user.
 
+The same playback path is available from a computer on the Wi-Fi network when the [LAN control API](lan-control.md) is enabled.
+
 ## Message format
 
 The cloud sends the following JSON through the device's current protocol control connection. For an

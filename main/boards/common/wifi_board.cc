@@ -20,6 +20,9 @@
 #ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
 #include "blufi.h"
 #endif
+#if CONFIG_LAN_CONTROL_API
+#include "lan_control_server.h"
+#endif
 
 static const char *TAG = "WifiBoard";
 
@@ -39,6 +42,9 @@ WifiBoard::WifiBoard() {
 }
 
 WifiBoard::~WifiBoard() {
+#if CONFIG_LAN_CONTROL_API
+    LanControlServer::GetInstance().Stop();
+#endif
     if (connect_timer_) {
         esp_timer_stop(connect_timer_);
         esp_timer_delete(connect_timer_);
@@ -125,6 +131,9 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
 #endif
             in_config_mode_ = false;
             ESP_LOGI(TAG, "Connected to WiFi: %s", data.c_str());
+#if CONFIG_LAN_CONTROL_API
+            LanControlServer::GetInstance().Start();
+#endif
             break;
         case NetworkEvent::Scanning:
             ESP_LOGI(TAG, "WiFi scanning");
@@ -134,10 +143,16 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
             break;
         case NetworkEvent::Disconnected:
             ESP_LOGW(TAG, "WiFi disconnected");
+#if CONFIG_LAN_CONTROL_API
+            LanControlServer::GetInstance().Stop();
+#endif
             break;
         case NetworkEvent::WifiConfigModeEnter:
             ESP_LOGI(TAG, "WiFi config mode entered");
             in_config_mode_ = true;
+#if CONFIG_LAN_CONTROL_API
+            LanControlServer::GetInstance().Stop();
+#endif
             break;
         case NetworkEvent::WifiConfigModeExit:
             ESP_LOGI(TAG, "WiFi config mode exited");
@@ -168,6 +183,10 @@ void WifiBoard::OnWifiConnectTimeout(void* arg) {
 }
 
 void WifiBoard::StartWifiConfigMode() {
+#if CONFIG_LAN_CONTROL_API
+    // Stop before the provisioning AP comes up so the API is not reachable there.
+    LanControlServer::GetInstance().Stop();
+#endif
     in_config_mode_ = true;
     // Transition to wifi configuring state
     Application::GetInstance().SetDeviceState(kDeviceStateWifiConfiguring);

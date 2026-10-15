@@ -125,6 +125,7 @@ The firmware connects to the official [xiaozhi.me](https://xiaozhi.me) server by
 - [MCP Protocol Interaction Flow](docs/mcp-protocol.md) - Device-side MCP protocol implementation
 - [MQTT + UDP Hybrid Communication Protocol Document](docs/mqtt-udp.md)
 - [A detailed WebSocket communication protocol document](docs/websocket.md)
+- [LAN Control API](docs/lan-control.md) - Play a hosted Ogg Opus file and set emotions from a computer on the same network
 
 ## Large Model Configuration
 

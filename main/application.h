@@ -88,6 +88,14 @@ public:
     void Alert(const char* status, const char* message, const char* emotion = "", const std::string_view& sound = "");
     void DismissAlert();
 
+    /**
+     * Queue StartNotification on the main loop.
+     * Playback starts only while Idle. audio_url must be an http(s) URL that
+     * serves one mono Ogg Opus stream and does not redirect.
+     * Safe to call from any task.
+     */
+    void EnqueueNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
+
     void AbortSpeaking(AbortReason reason);
 
     /**
