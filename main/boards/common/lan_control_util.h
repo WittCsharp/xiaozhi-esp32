@@ -109,6 +109,26 @@ inline bool IsJsonContentType(std::string_view content_type) {
     return next == ';' || next == ' ' || next == '\t';
 }
 
+constexpr std::size_t kMaxBridgeUrlLen = kMaxAudioUrlLen;
+
+// Bridge base URL. Same rules as an audio URL: lowercase http(s), a host, no
+// spaces. A path is optional (`http://192.168.1.20:9100`).
+inline bool IsBridgeUrl(std::string_view url) { return IsAudioUrl(url); }
+
+// Optional bearer the device sends to the Mac bridge. Empty clears the stored
+// token. NVS keys are at most 15 characters, so the key is "bridge_token".
+inline bool IsBridgeToken(std::string_view token) {
+    if (token.size() > kMaxTokenLen) {
+        return false;
+    }
+    for (unsigned char c : token) {
+        if (c <= 0x20 || c >= 0x7f) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline bool IsWholeAngle(double value, int& angle) {
     if (!(value >= static_cast<double>(kServoMinAngle) &&
           value <= static_cast<double>(kServoMaxAngle))) {

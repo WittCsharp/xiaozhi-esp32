@@ -1,8 +1,11 @@
 #include "lan_control_util.h"
+#include "body_uplink_format.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -60,6 +63,26 @@ int main() {
     EXPECT(!IsJsonContentType("text/plain"));
     EXPECT(!IsJsonContentType("application/json-patch"));
     EXPECT(!IsJsonContentType(""));
+
+    EXPECT(lan_control::IsBridgeUrl("http://192.168.1.20:9100"));
+    EXPECT(lan_control::IsBridgeUrl("http://192.168.1.20:9100/"));
+    EXPECT(!lan_control::IsBridgeUrl(""));
+    EXPECT(!lan_control::IsBridgeUrl("http://"));
+    EXPECT(lan_control::IsBridgeToken(""));
+    EXPECT(lan_control::IsBridgeToken("bridge-secret"));
+    EXPECT(!lan_control::IsBridgeToken("has space"));
+    EXPECT(!lan_control::IsBridgeToken(std::string(lan_control::kMaxTokenLen + 1, 'a')));
+
+    std::vector<uint8_t> clip;
+    const uint8_t first[] = {'a', 'b'};
+    const uint8_t second[] = {'x', 'y', 'z'};
+    EXPECT(body_bridge::AppendOpusFrame(clip, first, 2, 32));
+    EXPECT(body_bridge::AppendOpusFrame(clip, second, 3, 32));
+    const uint8_t expected[] = {0x02, 0x00, 'a', 'b', 0x03, 0x00, 'x', 'y', 'z'};
+    EXPECT(clip.size() == sizeof(expected));
+    EXPECT(clip.size() == sizeof(expected) && std::equal(clip.begin(), clip.end(), expected));
+    EXPECT(!body_bridge::AppendOpusFrame(clip, first, 2, clip.size()));
+    EXPECT(body_bridge::AppendOpusFrame(clip, nullptr, 0, clip.size() + 2));
 
     int angle = 123;
     EXPECT(IsWholeAngle(0, angle) && angle == 0);

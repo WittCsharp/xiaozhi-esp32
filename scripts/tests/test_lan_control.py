@@ -112,8 +112,18 @@ class LanControlScriptTests(unittest.TestCase):
 class LanControlWiringTests(unittest.TestCase):
     def test_routes_use_existing_application_apis(self):
         server = (ROOT / "main" / "boards" / "common" / "lan_control_server.cc").read_text(encoding="utf-8")
-        for route in ("/api/health", "/api/notify", "/api/alert", "/api/servo"):
+        for route in (
+            "/api/health",
+            "/api/notify",
+            "/api/alert",
+            "/api/servo",
+            "/api/mode",
+            "/api/bridge",
+        ):
             self.assertIn(route, server)
+        self.assertIn("body_mode", server)
+        self.assertIn("invalid_mode", server)
+        self.assertIn("invalid_bridge", server)
         self.assertIn("EnqueueNotification", server)
         self.assertIn(".Alert(", server)
         self.assertNotIn("driver/gpio.h", server)
@@ -130,6 +140,46 @@ class LanControlWiringTests(unittest.TestCase):
         self.assertIn("config LAN_CONTROL_API", kconfig)
         self.assertIn('default ""', kconfig)
         self.assertIn("lan_api", kconfig)
+        self.assertIn("config BODY_MODE_DEFAULT", kconfig)
+
+    def test_body_mode_boot_skips_cloud_open(self):
+        app = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
+        toggle = _definition(app, "void Application::HandleToggleChatEvent()")
+        self.assertLess(toggle.index("BeginBodyListen"), toggle.index("ContinueOpenAudioChannel"))
+        begin = _definition(app, "void Application::BeginBodyListen(const char* source)")
+        self.assertNotIn("OpenAudioChannel", begin)
+        self.assertIn("cloud chat skipped", begin)
+        reopen = _definition(app, "void Application::ContinueOpenAudioChannel(ListeningMode mode)")
+        self.assertLess(reopen.index("body_bridge::Enabled()"), reopen.index("protocol_->OpenAudioChannel"))
+        wake_continue = _definition(
+            app, "void Application::ContinueWakeWordInvoke(const std::string& wake_word)"
+        )
+        self.assertLess(
+            wake_continue.index("body_bridge::Enabled()"),
+            wake_continue.index("protocol_->OpenAudioChannel"),
+        )
+        wake = _definition(app, "void Application::HandleWakeWordDetectedEvent()")
+        self.assertLess(wake.index("HandleBodyWakeWord"), wake.index("BeginWakeWordInvoke"))
+        send = app.split("if (bits & MAIN_EVENT_SEND_AUDIO)", 1)[1].split(
+            "MAIN_EVENT_WAKE_WORD_DETECTED", 1
+        )[0]
+        self.assertLess(send.index("RouteBodyUplink"), send.index("SendAudio"))
+        uplink = (ROOT / "main" / "boards" / "common" / "body_bridge.cc").read_text(encoding="utf-8")
+        self.assertIn('kBodyModeKey = "body_mode"', uplink)
+        self.assertIn('kBridgeUrlKey = "bot_bridge_url"', uplink)
+        self.assertIn('kBridgeTokenKey = "bridge_token"', uplink)
+        cmake = (ROOT / "main" / "CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertIn("body_bridge.cc", cmake)
+
+
+def _definition(source, signature):
+    start = source.index(signature)
+    brace = source.index("{", start)
+    depth, end = 1, brace + 1
+    while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+    return source[start:end]
 
 
 if __name__ == "__main__":

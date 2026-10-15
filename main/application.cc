@@ -3,6 +3,9 @@
 #include "assets/lang_config.h"
 #include "audio_codec.h"
 #include "board.h"
+#if CONFIG_LAN_CONTROL_API
+#include "body_bridge.h"
+#endif
 #include "cjson_utils.h"
 #include "display.h"
 #include "mcp_server.h"
@@ -243,15 +246,22 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
-            while (auto packet = audio_service_.PopPacketFromSendQueue()) {
-                if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
-                    // Drop the remaining packets. Leaving them in the queue would
-                    // stall the Opus codec task (it waits for queue space), which in
-                    // turn deadlocks the whole audio input pipeline, as no new
-                    // MAIN_EVENT_SEND_AUDIO event would ever be triggered again.
-                    while (audio_service_.PopPacketFromSendQueue())
-                        ;
-                    break;
+#if CONFIG_LAN_CONTROL_API
+            if (RouteBodyUplink()) {
+                // Body mode keeps the mic off the cloud socket.
+            } else
+#endif
+            {
+                while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+                    if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
+                        // Drop the remaining packets. Leaving them in the queue would
+                        // stall the Opus codec task (it waits for queue space), which in
+                        // turn deadlocks the whole audio input pipeline, as no new
+                        // MAIN_EVENT_SEND_AUDIO event would ever be triggered again.
+                        while (audio_service_.PopPacketFromSendQueue())
+                            ;
+                        break;
+                    }
                 }
             }
         }
@@ -265,6 +275,9 @@ void Application::Run() {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
             }
+#if CONFIG_LAN_CONTROL_API
+            body_bridge::Session::GetInstance().OnVad(audio_service_.IsVoiceDetected());
+#endif
         }
 
         if (bits & MAIN_EVENT_SCHEDULE) {
@@ -330,8 +343,15 @@ void Application::HandleNetworkDisconnectedEvent() {
     }
     if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
         state == kDeviceStateSpeaking) {
-        ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
-        protocol_->CloseAudioChannel();
+#if CONFIG_LAN_CONTROL_API
+        if (body_bridge::Session::GetInstance().IsCapturing()) {
+            ESP_LOGI(TAG, "Network lost during body listen; keeping local capture");
+        } else
+#endif
+        {
+            ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
+            protocol_->CloseAudioChannel();
+        }
     }
 
     // Update the status bar immediately to show the network state
@@ -581,8 +601,19 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnAudioChannelClosed([this, &board]() {
+#if CONFIG_LAN_CONTROL_API
+        if (!body_bridge::Session::GetInstance().IsCapturing()) {
+            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        }
+#else
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+#endif
         Schedule([this]() {
+#if CONFIG_LAN_CONTROL_API
+            if (body_bridge::Session::GetInstance().IsCapturing()) {
+                return;
+            }
+#endif
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
@@ -790,6 +821,114 @@ void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT
 
 void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
 
+#if CONFIG_LAN_CONTROL_API
+void Application::BeginBodyListen(const char* source) {
+    auto& session = body_bridge::Session::GetInstance();
+    if (session.IsCapturing()) {
+        return;
+    }
+    // Mark the session before closing a cloud socket. The close callback
+    // returns the device to idle, and it bails out while a body capture is active.
+    if (!session.Begin(source, [this](const char* reason) {
+            std::string why(reason != nullptr ? reason : "timeout");
+            Schedule([this, why]() { EndBodyListen(why.c_str()); });
+        })) {
+        return;
+    }
+    if (protocol_ != nullptr && protocol_->IsAudioChannelOpened()) {
+        protocol_->CloseAudioChannel();
+    }
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    listening_mode_ = kListeningModeManualStop;
+    if (!SetDeviceState(kDeviceStateListening)) {
+        session.Cancel();
+        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        ESP_LOGW(TAG, "Body listen rejected");
+        return;
+    }
+    ESP_LOGI(TAG, "Body listen started (%s); cloud chat skipped", source != nullptr ? source : "");
+}
+
+void Application::EndBodyListen(const char* reason) {
+    const body_bridge::ClipResult result = body_bridge::Session::GetInstance().Finish(reason);
+    if (result == body_bridge::ClipResult::kNotCapturing) {
+        return;
+    }
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    if (GetDeviceState() == kDeviceStateListening) {
+        SetDeviceState(kDeviceStateIdle);
+    }
+    const bool missing = result == body_bridge::ClipResult::kNoBridge;
+    const bool failed = result == body_bridge::ClipResult::kUploadFailed;
+    Schedule([this, missing, failed]() {
+        if (GetDeviceState() != kDeviceStateIdle) {
+            return;
+        }
+        auto* display = Board::GetInstance().GetDisplay();
+        if (missing) {
+            display->SetStatus("Bridge");
+            display->SetEmotion("sad");
+            display->SetChatMessage("system", "Set bot bridge URL");
+            return;
+        }
+        if (failed) {
+            display->SetStatus("Bridge");
+            display->SetEmotion("sad");
+            display->SetChatMessage("system", "Bridge upload failed");
+            return;
+        }
+        display->SetStatus("Thinking");
+        display->SetEmotion("thinking");
+        display->SetChatMessage("system", "");
+    });
+    ESP_LOGI(TAG, "Body listen stopped (%s)", reason != nullptr ? reason : "");
+}
+
+void Application::HandleBodyWakeWord() {
+    if (body_bridge::Session::GetInstance().IsCapturing()) {
+        ConfigureWakeWordForListening();
+        return;
+    }
+    auto state = GetDeviceState();
+    if (state == kDeviceStateActivating) {
+        SetDeviceState(kDeviceStateIdle);
+        return;
+    }
+    if (state == kDeviceStateNotifying) {
+        StopNotification();
+        state = kDeviceStateIdle;
+    }
+    if (state == kDeviceStateSpeaking) {
+        AbortSpeaking(kAbortReasonWakeWordDetected);
+    }
+    if (state == kDeviceStateIdle || state == kDeviceStateSpeaking ||
+        state == kDeviceStateListening) {
+        play_popup_on_listening_ = true;
+        BeginBodyListen("wake");
+    }
+}
+
+bool Application::RouteBodyUplink() {
+    auto& session = body_bridge::Session::GetInstance();
+    if (!body_bridge::Enabled() && !session.IsCapturing()) {
+        return false;
+    }
+    bool overflow = false;
+    while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+        if (session.IsCapturing() && !session.Accept(std::move(packet))) {
+            overflow = true;
+            break;
+        }
+    }
+    if (overflow) {
+        while (audio_service_.PopPacketFromSendQueue()) {
+        }
+        EndBodyListen("full");
+    }
+    return true;
+}
+#endif
+
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
 
@@ -810,6 +949,23 @@ void Application::HandleToggleChatEvent() {
         SetDeviceState(kDeviceStateWifiConfiguring);
         return;
     }
+
+#if CONFIG_LAN_CONTROL_API
+    if (body_bridge::Session::GetInstance().IsCapturing()) {
+        EndBodyListen("button");
+        return;
+    }
+    if (body_bridge::Enabled()) {
+        if (state == kDeviceStateIdle) {
+            BeginBodyListen("button");
+        } else if (state == kDeviceStateSpeaking) {
+            AbortSpeaking(kAbortReasonNone);
+        } else if (state == kDeviceStateListening && protocol_ != nullptr) {
+            protocol_->CloseAudioChannel();
+        }
+        return;
+    }
+#endif
 
     if (!protocol_) {
         ESP_LOGE(TAG, "Protocol not initialized");
@@ -837,6 +993,13 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     if (GetDeviceState() != kDeviceStateConnecting) {
         return;
     }
+#if CONFIG_LAN_CONTROL_API
+    // A listen requested before body mode was enabled must not open cloud chat.
+    if (body_bridge::Enabled()) {
+        SetDeviceState(kDeviceStateIdle);
+        return;
+    }
+#endif
 
     // Switch to performance mode before connecting to reduce latency
     auto& board = Board::GetInstance();
@@ -871,6 +1034,19 @@ void Application::HandleStartListeningEvent() {
         return;
     }
 
+#if CONFIG_LAN_CONTROL_API
+    if (body_bridge::Enabled() || body_bridge::Session::GetInstance().IsCapturing()) {
+        if (!body_bridge::Session::GetInstance().IsCapturing() &&
+            (state == kDeviceStateIdle || state == kDeviceStateSpeaking)) {
+            if (state == kDeviceStateSpeaking) {
+                AbortSpeaking(kAbortReasonNone);
+            }
+            BeginBodyListen("button");
+        }
+        return;
+    }
+#endif
+
     if (!protocol_) {
         ESP_LOGE(TAG, "Protocol not initialized");
         return;
@@ -891,6 +1067,12 @@ void Application::HandleStartListeningEvent() {
 }
 
 void Application::HandleStopListeningEvent() {
+#if CONFIG_LAN_CONTROL_API
+    if (body_bridge::Session::GetInstance().IsCapturing()) {
+        EndBodyListen("button");
+        return;
+    }
+#endif
     auto state = GetDeviceState();
 
     if (state == kDeviceStateNotifying) {
@@ -908,6 +1090,12 @@ void Application::HandleStopListeningEvent() {
 }
 
 void Application::HandleWakeWordDetectedEvent() {
+#if CONFIG_LAN_CONTROL_API
+    if (body_bridge::Enabled() || body_bridge::Session::GetInstance().IsCapturing()) {
+        HandleBodyWakeWord();
+        return;
+    }
+#endif
     if (!protocol_) {
         return;
     }
@@ -973,6 +1161,12 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     if (GetDeviceState() != kDeviceStateConnecting) {
         return;
     }
+#if CONFIG_LAN_CONTROL_API
+    if (body_bridge::Enabled()) {
+        SetDeviceState(kDeviceStateIdle);
+        return;
+    }
+#endif
 
     // Switch to performance mode before connecting to reduce latency
     auto& board = Board::GetInstance();
@@ -1156,8 +1350,15 @@ void Application::StartListeningAudio() {
         return;
     }
 
-    // Send the start listening command
+    // Cloud listen announces itself on the open channel. Body mode records
+    // locally and must not send that, or a closed socket looks like a failure.
+#if CONFIG_LAN_CONTROL_API
+    if (!body_bridge::Enabled() && !body_bridge::Session::GetInstance().IsCapturing()) {
+        protocol_->SendStartListening(listening_mode_);
+    }
+#else
     protocol_->SendStartListening(listening_mode_);
+#endif
     audio_service_.EnableVoiceProcessing(true);
 
     ConfigureWakeWordForListening();

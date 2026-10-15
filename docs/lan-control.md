@@ -64,8 +64,10 @@ curl -sS "$DEVICE/api/notify" \
 `GET /api/health` returns `200`:
 
 ```json
-{"ok":true,"state":"idle","ip":"192.168.1.50","port":8080}
+{"ok":true,"state":"idle","ip":"192.168.1.50","port":8080,"body_mode":false,"bridge":"missing"}
 ```
+
+`body_mode` is whether BOOT and wake skip cloud chat. `bridge` is `configured` when a Mac bridge URL is stored, otherwise `missing`. See [Bot as brain](bot-as-brain.md).
 
 `POST /api/alert` calls `Application::Alert(status, message, emotion)` on the main loop and returns `200`. It updates the status line, emotion, and subtitle. It does not play the cloud alert vibration. `status`, `message`, and `emotion` are required, non-empty strings. Emotion names are the same ones the cloud sends, such as `neutral`, `happy`, and `sad`. Unknown names are still forwarded to the display.
 
@@ -110,6 +112,37 @@ python3 scripts/lan_control/mac_speak.py \
 
 `--emotion` posts `/api/alert` first, then `/api/notify` when `--text` or `--ogg` is set. `--ogg` skips TTS and serves an existing file. The script keeps the file server up until the device returns to `idle` or the wait expires.
 
+## Body mode
+
+`POST /api/mode` and `POST /api/bridge` use the same bearer token. They store settings in NVS namespace `lan_api`. Cloud chat is unchanged while body mode is off.
+
+```bash
+curl -sS "$DEVICE/api/mode" \
+  -H "Authorization: Bearer $XIAOZHI_LAN_TOKEN"
+
+curl -sS -X POST "$DEVICE/api/mode" \
+  -H "Authorization: Bearer $XIAOZHI_LAN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"body":true}'
+
+curl -sS -X POST "$DEVICE/api/bridge" \
+  -H "Authorization: Bearer $XIAOZHI_LAN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"http://192.168.1.20:9100"}'
+```
+
+`body` is a JSON boolean. The response is `200`:
+
+```json
+{"ok":true,"body_mode":true,"bridge":"configured"}
+```
+
+`url` is `http://` or `https://` with a host, at most 480 characters. An empty string clears it. `token` is optional. Omit it to leave the stored bridge token alone; send `""` to clear it. The token is not returned. `GET /api/bridge` returns the URL and `token_set`.
+
+NVS keys, all in `lan_api`: `body_mode`, `bot_bridge_url`, and `bridge_token`. The token key is not `bot_bridge_token` because an NVS key is at most 15 characters. When `body_mode` has never been written, Kconfig `BODY_MODE_DEFAULT` applies (off unless you turn it on).
+
+Turning body mode off while the device is in a local listen stops that listen. The next BOOT uses cloud chat again.
+
 ## Servo stub
 
 `POST /api/servo` is reserved so a later pan/tilt driver can share this port. It checks `pan` and `tilt` as whole degrees from -90 to 90 and returns `200` without driving a pin:
@@ -132,7 +165,7 @@ GPIO8 is the intended pan pin and GPIO9 is the intended tilt pin. They are not c
 | HTTP | `error` | When |
 | --- | --- | --- |
 | 401 | `unauthorized` | Missing or wrong bearer token |
-| 400 | `invalid_json`, `invalid_audio_url`, `invalid_subtitles`, `invalid_alert`, `invalid_servo` | Body rejected |
+| 400 | `invalid_json`, `invalid_audio_url`, `invalid_subtitles`, `invalid_alert`, `invalid_servo`, `invalid_mode`, `invalid_bridge` | Body rejected |
 | 409 | `busy` | Notify while the device is not idle |
 | 413 | `payload_too_large` | Body over 4 KB |
 | 415 | `unsupported_media_type` | POST without `application/json` |
