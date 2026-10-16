@@ -14,6 +14,9 @@
 namespace body_bridge {
 
 constexpr size_t kMaxBodyClipBytes = 32 * 1024;
+// Silence after local VAD has already gone quiet. 600 ms is shorter than the
+// previous 1 s endpoint and still longer than a brief pause between words.
+constexpr uint64_t kPostSpeechSilenceUs = 600000;
 
 inline bool AppendOpusFrame(std::vector<uint8_t>& out, const uint8_t* data, size_t size,
                             size_t max_bytes) {

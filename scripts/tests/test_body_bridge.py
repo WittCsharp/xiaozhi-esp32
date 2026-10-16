@@ -60,6 +60,16 @@ class BodyBridgeTests(unittest.TestCase):
         )
         self.assertEqual((status, body["frames"], body["bytes"]), (200, 1, 3))
         self.assertEqual(config.clips, 1)
+        status, body = bridge.handle_uplink(
+            "/body/event",
+            {},
+            json.dumps({"event": "speech_pause", "source": "wake", "reason": "silence"}).encode(),
+            config,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(config.clips, 1)
+        self.assertIn("stream_speak.py", bridge.stream_speak_hint("http://192.168.1.50:8080", "secret"))
 
         status, body = bridge.handle_uplink("/nope", {}, b"", config)
         self.assertEqual(status, 404)

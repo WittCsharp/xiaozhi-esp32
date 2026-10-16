@@ -1177,10 +1177,13 @@ menu "LAN Control API"
     config LAN_CONTROL_API
         bool "Enable LAN HTTP control API"
         default n
+        select HTTPD_WS_SUPPORT
+        select HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
         help
             After Wi-Fi associates, listen on the local network so a computer
             can play a notification and set the on-screen alert. The computer
-            hosts a mono Ogg Opus file. The device plays that URL with
+            hosts a mono Ogg Opus file, or pushes Opus/PCM on /api/speak while
+            body mode is on. Notification playback uses
             Application::StartNotification. This does not add onboard TTS and
             does not change the cloud WebSocket or MQTT connection.
 

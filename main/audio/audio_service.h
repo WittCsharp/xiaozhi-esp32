@@ -143,6 +143,10 @@ public:
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
+    // Mono s16le PCM at sample_rate. Resampled to the codec rate when needed.
+    // playback_id 0 skips the notify progress callback.
+    bool PushPcmToPlaybackQueue(std::vector<int16_t> pcm, int sample_rate, uint32_t playback_id,
+                                uint32_t media_position_ms, bool wait);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
@@ -160,6 +164,8 @@ private:
     std::mutex input_resampler_mutex_;
     esp_ae_rate_cvt_handle_t input_resampler_ = nullptr;
     esp_ae_rate_cvt_handle_t output_resampler_ = nullptr;
+    esp_ae_rate_cvt_handle_t pcm_resampler_ = nullptr;
+    int pcm_resampler_rate_ = 0;
 
     // Encoder/Decoder state
     int encoder_sample_rate_ = 16000;
@@ -218,6 +224,7 @@ private:
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
     bool InitializeAudioEngine();
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
+    bool EnsurePcmResampler(int sample_rate);
     void CheckAndUpdateAudioPowerState();
     bool IsPlaybackDrainedLocked() const;
     bool MarkPlaybackDrainedLocked();

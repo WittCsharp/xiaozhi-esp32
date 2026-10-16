@@ -96,6 +96,13 @@ public:
      */
     void EnqueueNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
 
+#if CONFIG_LAN_CONTROL_API
+    // Main loop only. The LAN /api/speak WebSocket schedules these.
+    // Begin enters Speaking without opening cloud chat. Abort stops that playback.
+    bool BeginBodySpeak();
+    void AbortBodySpeak();
+#endif
+
     void AbortSpeaking(AbortReason reason);
 
     /**

@@ -5,6 +5,7 @@
 #include "board.h"
 #if CONFIG_LAN_CONTROL_API
 #include "body_bridge.h"
+#include "body_downlink.h"
 #endif
 #include "cjson_utils.h"
 #include "display.h"
@@ -223,6 +224,9 @@ void Application::Run() {
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
             if (audio_service_.IsPlaybackIdle()) {
                 notify_player_.OnPlaybackDrained();
+#if CONFIG_LAN_CONTROL_API
+                body_downlink::OnPlaybackDrained();
+#endif
             }
             // Deferred listening start (auto mode): the playback queue has
             // drained, so it is now safe to enable voice processing.
@@ -344,8 +348,13 @@ void Application::HandleNetworkDisconnectedEvent() {
     if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
         state == kDeviceStateSpeaking) {
 #if CONFIG_LAN_CONTROL_API
+        if (body_downlink::IsActive()) {
+            Schedule([this]() { AbortBodySpeak(); });
+        }
         if (body_bridge::Session::GetInstance().IsCapturing()) {
             ESP_LOGI(TAG, "Network lost during body listen; keeping local capture");
+        } else if (body_downlink::IsActive()) {
+            ESP_LOGI(TAG, "Network lost during body speak; cloud channel stays closed");
         } else
 #endif
         {
@@ -585,6 +594,12 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
+#if CONFIG_LAN_CONTROL_API
+        // Body mode plays LAN audio only. A leftover cloud socket must not mix in.
+        if (body_bridge::Enabled() || body_downlink::IsActive()) {
+            return;
+        }
+#endif
         if (GetDeviceState() == kDeviceStateSpeaking) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
@@ -610,7 +625,7 @@ void Application::InitializeProtocol() {
 #endif
         Schedule([this]() {
 #if CONFIG_LAN_CONTROL_API
-            if (body_bridge::Session::GetInstance().IsCapturing()) {
+            if (body_bridge::Session::GetInstance().IsCapturing() || body_downlink::IsActive()) {
                 return;
             }
 #endif
@@ -661,6 +676,12 @@ void Application::InitializeProtocol() {
                 StartNotification(std::move(url), std::move(subtitles));
             });
         } else if (strcmp(type->valuestring, "tts") == 0) {
+#if CONFIG_LAN_CONTROL_API
+            if (body_bridge::Enabled() || body_downlink::IsActive()) {
+                ESP_LOGD(TAG, "Ignoring cloud tts in body mode");
+                return;
+            }
+#endif
             auto state = cJSON_GetObjectItem(root, "state");
             if (!cJSON_IsString(state)) {
                 return;
@@ -697,6 +718,11 @@ void Application::InitializeProtocol() {
                 }
             }
         } else if (strcmp(type->valuestring, "stt") == 0) {
+#if CONFIG_LAN_CONTROL_API
+            if (body_bridge::Enabled() || body_downlink::IsActive()) {
+                return;
+            }
+#endif
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 std::vector<TextGlyph> glyphs;
@@ -712,6 +738,11 @@ void Application::InitializeProtocol() {
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
+#if CONFIG_LAN_CONTROL_API
+            if (body_bridge::Enabled() || body_downlink::IsActive()) {
+                return;
+            }
+#endif
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(emotion)) {
                 Schedule([display, emotion_str = std::string(emotion->valuestring)]() {
@@ -822,6 +853,41 @@ void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT
 void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
 
 #if CONFIG_LAN_CONTROL_API
+bool Application::BeginBodySpeak() {
+    if (!body_downlink::PrepareBegin()) {
+        return false;
+    }
+    if (!body_bridge::Enabled()) {
+        body_downlink::CompleteStart(body_downlink::StartStatus::kBodyModeOff);
+        return false;
+    }
+    if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
+        body_bridge::Session::GetInstance().IsCapturing()) {
+        body_downlink::CompleteStart(body_downlink::StartStatus::kBusy);
+        return false;
+    }
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    if (!SetDeviceState(kDeviceStateSpeaking)) {
+        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        body_downlink::CompleteStart(body_downlink::StartStatus::kBusy);
+        return false;
+    }
+    // Decoder reset runs in the speaking state handler, which then accepts audio.
+    return true;
+}
+
+void Application::AbortBodySpeak() {
+    const bool active = body_downlink::Cancel();
+    if (!active && GetDeviceState() != kDeviceStateSpeaking) {
+        return;
+    }
+    audio_service_.ResetDecoder();
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    if (GetDeviceState() == kDeviceStateSpeaking) {
+        SetDeviceState(kDeviceStateIdle);
+    }
+}
+
 void Application::BeginBodyListen(const char* source) {
     auto& session = body_bridge::Session::GetInstance();
     if (session.IsCapturing()) {
@@ -902,10 +968,10 @@ void Application::HandleBodyWakeWord() {
         StopNotification();
         state = kDeviceStateIdle;
     }
-    if (state == kDeviceStateSpeaking) {
+    if (state == kDeviceStateSpeaking || body_downlink::IsActive()) {
         AbortSpeaking(kAbortReasonWakeWordDetected);
-        // Drop cloud TTS before the chime. Body mode must not keep that playback.
-        audio_service_.ResetDecoder();
+        // Drop LAN or leftover cloud audio before the chime.
+        AbortBodySpeak();
     }
     // Connecting is included so a wake during a leftover cloud open still
     // records locally instead of waiting on that socket.
@@ -964,10 +1030,11 @@ void Application::HandleToggleChatEvent() {
         return;
     }
     if (body_bridge::Enabled()) {
-        if (state == kDeviceStateIdle) {
-            BeginBodyListen("button");
-        } else if (state == kDeviceStateSpeaking) {
+        if (body_downlink::IsActive() || state == kDeviceStateSpeaking) {
             AbortSpeaking(kAbortReasonNone);
+            AbortBodySpeak();
+        } else if (state == kDeviceStateIdle) {
+            BeginBodyListen("button");
         } else if (state == kDeviceStateListening && protocol_ != nullptr) {
             protocol_->CloseAudioChannel();
         }
@@ -1045,9 +1112,11 @@ void Application::HandleStartListeningEvent() {
 #if CONFIG_LAN_CONTROL_API
     if (body_bridge::Enabled() || body_bridge::Session::GetInstance().IsCapturing()) {
         if (!body_bridge::Session::GetInstance().IsCapturing() &&
-            (state == kDeviceStateIdle || state == kDeviceStateSpeaking)) {
-            if (state == kDeviceStateSpeaking) {
+            (state == kDeviceStateIdle || state == kDeviceStateSpeaking ||
+             body_downlink::IsActive())) {
+            if (state == kDeviceStateSpeaking || body_downlink::IsActive()) {
                 AbortSpeaking(kAbortReasonNone);
+                AbortBodySpeak();
             }
             BeginBodyListen("button");
         }
@@ -1078,6 +1147,10 @@ void Application::HandleStopListeningEvent() {
 #if CONFIG_LAN_CONTROL_API
     if (body_bridge::Session::GetInstance().IsCapturing()) {
         EndBodyListen("button");
+        return;
+    }
+    if (body_downlink::IsActive()) {
+        AbortBodySpeak();
         return;
     }
 #endif
@@ -1267,6 +1340,10 @@ void Application::HandleStateChangedEvent() {
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
             audio_service_.ResetDecoder();
+#if CONFIG_LAN_CONTROL_API
+            // Runs after the reset so streamed packets are not wiped.
+            body_downlink::OnSpeakingEntered();
+#endif
             break;
         case kDeviceStateNotifying:
             display->SetStatus(Lang::Strings::SPEAKING);

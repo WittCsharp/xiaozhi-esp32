@@ -34,7 +34,6 @@ constexpr const char* kBridgeTokenKey = "bridge_token";
 constexpr int kHttpTimeoutMs = 8000;
 constexpr uint32_t kUploadStackBytes = 8192;
 constexpr uint64_t kMaxListenUs = 8ULL * 1000ULL * 1000ULL;
-constexpr uint64_t kSilenceUs = 1000ULL * 1000ULL;
 constexpr size_t kMaxQueuedJobs = 8;
 
 static_assert(sizeof("body_mode") - 1 <= 15, "NVS key too long");
@@ -359,7 +358,7 @@ void Session::StopTimers() {
 void Session::ArmSilenceTimer() {
     EnsureTimers();
     (void)esp_timer_stop(silence_timer_);
-    if (esp_timer_start_once(silence_timer_, kSilenceUs) != ESP_OK) {
+    if (esp_timer_start_once(silence_timer_, kPostSpeechSilenceUs) != ESP_OK) {
         ESP_LOGW(TAG, "Failed to arm body silence timer");
     }
 }
@@ -388,6 +387,7 @@ bool Session::Begin(const char* source, StopCallback on_stop) {
         }
         capturing_ = true;
         heard_voice_ = false;
+        pause_notified_ = false;
         source_ = source != nullptr ? source : "button";
         on_stop_ = std::move(on_stop);
         audio_.clear();
@@ -415,6 +415,7 @@ bool Session::Begin(const char* source, StopCallback on_stop) {
 void Session::OnVad(bool speaking) {
     bool arm = false;
     bool disarm = false;
+    bool notify_pause = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!capturing_) {
@@ -425,12 +426,36 @@ void Session::OnVad(bool speaking) {
             disarm = true;
         } else if (heard_voice_) {
             arm = true;
+            if (!pause_notified_) {
+                pause_notified_ = true;
+                notify_pause = true;
+            }
         }
     }
     if (disarm) {
         DisarmSilenceTimer();
     } else if (arm) {
         ArmSilenceTimer();
+        if (notify_pause) {
+            std::string source;
+            int frames = 0;
+            int bytes = 0;
+            int sample_rate = 16000;
+            int frame_ms = 60;
+            uint32_t clip_id = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                source = source_;
+                frames = frames_;
+                bytes = static_cast<int>(audio_.size());
+                sample_rate = sample_rate_;
+                frame_ms = frame_ms_;
+                clip_id = clip_id_;
+            }
+            // Hint only. The clip is still open until the silence timer fires.
+            QueueEvent("speech_pause", source.c_str(), "silence", frames, bytes, sample_rate,
+                       frame_ms, true, false, clip_id);
+        }
     }
 }
 

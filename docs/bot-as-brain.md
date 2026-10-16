@@ -2,14 +2,15 @@
 
 Body mode makes the device a microphone, speaker, and face. A computer on the same Wi-Fi is the brain. Cloud WebSocket chat stays available when body mode is off.
 
-Downlink is the existing [LAN control API](lan-control.md): `POST /api/alert` and `POST /api/notify`. This page is the uplink. The board has no onboard TTS. The Mac synthesizes speech with `scripts/lan_control/mac_speak.py`.
+Downlink is the [LAN control API](lan-control.md). `POST /api/notify` still plays a finished Ogg file. While body mode is on, `GET /api/speak` is a WebSocket the Mac can push Opus or PCM into before that file exists. The board has no onboard TTS. `scripts/lan_control/stream_speak.py` is the streaming client. `scripts/lan_control/mac_speak.py` remains the notify fallback.
 
 ```text
 wake word (BOOT is an optional start/stop)
     -> chime, then the device records Opus locally (no cloud socket)
     -> POST {bridge}/body/event and {bridge}/body/audio
     -> Mac bridge (ASR and the Bot are still TODO)
-    -> mac_speak.py -> POST /api/alert and POST /api/notify
+    -> stream_speak.py -> WebSocket /api/speak
+       or mac_speak.py -> POST /api/alert and POST /api/notify
 ```
 
 The spoken wake word is the normal way to start a clip. It calls `BeginBodyListen("wake")` and does not open cloud chat. The mic stays closed while the wake chime plays, so that sound is not treated as the utterance. BOOT still starts or stops a clip, and is not required.
@@ -81,7 +82,7 @@ python3 scripts/build.py bread-compact-wifi-lcd --wake-word nihaoxiaozhi
 
 1. Leave the device idle. The face should say standby, not connecting.
 2. Say the compiled wake word. The face shows listening and plays the short chime. It must not open the cloud conversation. The bridge logs `event listen_start` with `"source":"wake"`.
-3. After the chime, speak a short sentence. Silence for about one second after speech, or eight seconds, ends the clip. A second BOOT press also ends it.
+3. After the chime, speak a short sentence. The first time local VAD goes quiet the bridge gets `speech_pause`. That event means the clip is still open; do not speak a reply yet. About 0.6 s of continued silence, or eight seconds, ends the clip. A second BOOT press also ends it.
 4. The bridge logs the Opus byte count and frame count, then prints a `mac_speak.py` command. The device shows emotion `thinking` and returns to idle so a notification can play.
 5. Run that command (or start the bridge with `--reply "Hello from the bridge"`). The device should play it through `/api/notify` and show the emotion through `/api/alert`.
 
@@ -97,7 +98,7 @@ If the bridge URL is missing, the wake word and BOOT still do not open cloud cha
 {"event":"listen_start","source":"button","device_id":"aa:bb:cc:dd:ee:ff","ip":"192.168.1.50"}
 ```
 
-`event` is `listen_start`, `utterance`, or `listen_stop`. `source` is `button` or `wake`. `utterance` and `listen_stop` add `reason` (`button`, `silence`, `timeout`, or `full`), `frames`, `bytes`, `sample_rate`, and `frame_duration_ms`.
+`event` is `listen_start`, `speech_pause`, `utterance`, or `listen_stop`. `source` is `button` or `wake`. `speech_pause` is sent once, the first time VAD goes quiet after speech, and includes the same counters. The bytes are not uploaded yet. `utterance` and `listen_stop` add `reason` (`button`, `silence`, `timeout`, or `full`), `frames`, `bytes`, `sample_rate`, and `frame_duration_ms`. `reason` `silence` is the end of the utterance, about 0.6 s after VAD went quiet.
 
 `POST {bridge}/body/audio` with `Content-Type: application/octet-stream` is the clip. Each Opus packet is a little-endian `uint16` length followed by that many raw Opus bytes (not an Ogg page). Headers:
 
@@ -111,6 +112,6 @@ If the bridge URL is missing, the wake word and BOOT still do not open cloud cha
 | `X-Source` | `button` |
 | `Device-Id` | MAC address |
 
-The clip stops at 32 KB, eight seconds, a second of silence after speech, or another BOOT press. The main loop does not wait on the HTTP upload. A reply still has to find the device `idle`; poll `/api/health` if notify returns `409`.
+The clip stops at 32 KB, eight seconds, about 0.6 s of silence after speech, or another BOOT press. The main loop does not wait on the HTTP upload. A notify reply still has to find the device `idle`; poll `/api/health` if notify returns `409`. A streaming reply uses `/api/speak` while the device is idle and can start on the first audio chunk. See [Streaming speak](lan-control.md#streaming-speak).
 
 `scripts/lan_control/body_bridge.py` only logs the clip and can call `mac_speak.py`. Wiring the transcript into the Grok Bot is left as a TODO in that script.

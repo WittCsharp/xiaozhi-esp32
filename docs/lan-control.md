@@ -23,6 +23,10 @@ For a local `bread-compact-wifi-lcd` build, add the options to that variant's `s
 ]
 ```
 
+`CONFIG_LAN_CONTROL_API` selects the HTTP server WebSocket options the speak route needs (`HTTPD_WS_SUPPORT` and the pre-handshake callback). Leave those out of `sdkconfig_append`.
+
+The committed `bread-compact-wifi-lcd` panel is the ST7789 line above. A GC9A01 240×240 circle uses `CONFIG_LCD_GC9A01_240X240=y` **instead of** that ST7789 line. Do not enable both. This API does not change the default panel.
+
 ```bash
 python3 scripts/build.py bread-compact-wifi-lcd
 ```
@@ -111,6 +115,90 @@ python3 scripts/lan_control/mac_speak.py \
 ```
 
 `--emotion` posts `/api/alert` first, then `/api/notify` when `--text` or `--ogg` is set. `--ogg` skips TTS and serves an existing file. The script keeps the file server up until the device returns to `idle` or the wait expires.
+
+`mac_speak.py` waits until `say` and `ffmpeg` have written the whole file, then serves it with `Content-Length`. The device side of `/api/notify` does **not** wait for that file to finish downloading: `NotifyPlayer` demuxes Ogg and queues Opus as the HTTP body arrives (see [notify.md](notify.md)). The gap is on the computer. A bridge that only calls `mac_speak.py` cannot start the speaker until TTS has produced a complete Ogg.
+
+## Streaming speak
+
+`GET /api/speak` upgrades to a WebSocket when body mode is on. The Mac pushes Opus or PCM as it is synthesized. The device enters `speaking` and plays each frame before the rest of the utterance exists. It does not open the cloud audio channel, send `start-listening`, or run cloud Q&A. `/api/notify` stays the fallback for a finished Ogg URL.
+
+The listener is still LAN-only and cleartext. Send `Authorization: Bearer <token>` on the handshake. The pre-handshake check rejects a bad token with HTTP 401/503 and does not switch protocols.
+
+`esp_http_server` does not decode `Transfer-Encoding: chunked` request bodies, so a chunked POST cannot start playback early. Use WebSocket frames. Each frame is unfragmented (FIN set).
+
+First frame, text JSON:
+
+```json
+{"event":"start","codec":"opus","sample_rate":16000,"channels":1,"frame_duration_ms":20,"framing":"packet","text":"Hello","emotion":"happy"}
+```
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `event` | yes | `start`, then later `end` or `abort` |
+| `codec` | start | `opus` (default) or `pcm` |
+| `sample_rate` | no | 8000, 12000, 16000 (default), 24000, or 48000 |
+| `channels` | no | `1` only |
+| `frame_duration_ms` | opus | Hint. Each Opus packet's TOC duration is what is played. 5–120 ms, not 2.5 ms |
+| `framing` | opus | `packet` (one raw Opus packet per binary frame) or `length-prefixed` (same `uint16` little-endian sizes as the uplink clip) |
+| `text` | no | Assistant line, at most 200 bytes. Shown when playback is accepted |
+| `emotion` | no | Same names as `/api/alert` |
+
+PCM binary frames are little-endian mono `s16le` at `sample_rate`. There is no length prefix. Send about 20–60 ms per frame so the first chunk is small. The device resamples to the codec rate.
+
+The device replies with a text frame:
+
+```json
+{"ok":true,"event":"playing","playback_id":1}
+```
+
+Binary frames after that are played immediately. There is no popup chime on this path. `{"event":"end"}` means no more audio; the device answers `{"ok":true,"event":"ended"}` and stays in `speaking` until the queued audio drains, then returns to `idle`. Closing the socket after `playing` is the same as `end`: the tail still plays. Poll `/api/health`. `{"event":"abort"}`, a bad frame, or a wake word drops the tail. A wake word then starts a local listen.
+
+Busy, body mode off, and a bad frame are text errors, then the socket closes:
+
+```json
+{"ok":false,"error":"busy","state":"listening"}
+```
+
+| `error` | When |
+| --- | --- |
+| `body_mode_off` | `/api/mode` has not turned body mode on |
+| `busy` | Not idle, already speaking, capturing, or a notification is playing |
+| `timeout` | The main loop did not accept the stream |
+| `aborted` | Wake, BOOT, or another stop won the race |
+| `invalid_speak` | JSON, codec, rate, or audio frame rejected |
+
+A second stream is refused while one is active. The decode queue holds about 1.2 s of Opus, and the speak task holds at most 16 KB waiting to be queued, so a fast sender blocks instead of allocating the whole utterance.
+
+`scripts/lan_control/stream_speak.py` is the client. Push a raw file:
+
+```bash
+python3 scripts/lan_control/stream_speak.py \
+  --device "$DEVICE" \
+  --token "$XIAOZHI_LAN_TOKEN" \
+  --codec pcm \
+  --sample-rate 24000 \
+  --frame-ms 20 \
+  --pcm reply.s16le \
+  --text "Hello" \
+  --emotion happy
+```
+
+```python
+# From a bridge, with scripts/lan_control on PYTHONPATH, as TTS yields PCM:
+import sys
+sys.path.append("scripts/lan_control")
+from stream_speak import SpeakClient
+
+client = SpeakClient(device, token)
+client.connect()
+client.start(codec="pcm", sample_rate=24000, text=reply_text, emotion="happy")
+for chunk in tts_pcm_chunks():  # s16le mono; send each chunk when it exists
+    client.send_pcm(chunk)
+client.end()
+client.close()
+```
+
+Opus is the smaller path. One binary frame, one packet, `framing` left at `packet`. `frame_duration_ms` should match the encoder (20 ms for the `ffmpeg` line above). The TOC on the packet overrides that hint when it is a duration the firmware decoder accepts.
 
 ## Body mode
 
