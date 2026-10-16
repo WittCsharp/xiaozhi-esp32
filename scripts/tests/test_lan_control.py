@@ -160,6 +160,15 @@ class LanControlWiringTests(unittest.TestCase):
         )
         wake = _definition(app, "void Application::HandleWakeWordDetectedEvent()")
         self.assertLess(wake.index("HandleBodyWakeWord"), wake.index("BeginWakeWordInvoke"))
+        body_wake = _definition(app, "void Application::HandleBodyWakeWord()")
+        self.assertIn('BeginBodyListen("wake")', body_wake)
+        invoke = _definition(app, "void Application::WakeWordInvoke(const std::string& wake_word)")
+        self.assertLess(invoke.index("HandleBodyWakeWord"), invoke.index("BeginWakeWordInvoke"))
+        start = _definition(app, "void Application::StartListeningAudio()")
+        before_mic = start.split("EnableVoiceProcessing", 1)[0]
+        self.assertIn("pending_listening_start_", before_mic)
+        self.assertIn("IsPlaybackIdle()", before_mic)
+        self.assertIn("OGG_POPUP", before_mic)
         send = app.split("if (bits & MAIN_EVENT_SEND_AUDIO)", 1)[1].split(
             "MAIN_EVENT_WAKE_WORD_DETECTED", 1
         )[0]

@@ -833,6 +833,7 @@ void Application::BeginBodyListen(const char* source) {
             std::string why(reason != nullptr ? reason : "timeout");
             Schedule([this, why]() { EndBodyListen(why.c_str()); });
         })) {
+        play_popup_on_listening_ = false;
         return;
     }
     if (protocol_ != nullptr && protocol_->IsAudioChannelOpened()) {
@@ -841,6 +842,7 @@ void Application::BeginBodyListen(const char* source) {
     Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
     listening_mode_ = kListeningModeManualStop;
     if (!SetDeviceState(kDeviceStateListening)) {
+        play_popup_on_listening_ = false;
         session.Cancel();
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         ESP_LOGW(TAG, "Body listen rejected");
@@ -890,6 +892,8 @@ void Application::HandleBodyWakeWord() {
         return;
     }
     auto state = GetDeviceState();
+    const std::string wake_word = audio_service_.GetLastWakeWord();
+    ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
         return;
@@ -900,9 +904,13 @@ void Application::HandleBodyWakeWord() {
     }
     if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonWakeWordDetected);
+        // Drop cloud TTS before the chime. Body mode must not keep that playback.
+        audio_service_.ResetDecoder();
     }
+    // Connecting is included so a wake during a leftover cloud open still
+    // records locally instead of waiting on that socket.
     if (state == kDeviceStateIdle || state == kDeviceStateSpeaking ||
-        state == kDeviceStateListening) {
+        state == kDeviceStateListening || state == kDeviceStateConnecting) {
         play_popup_on_listening_ = true;
         BeginBodyListen("wake");
     }
@@ -1350,6 +1358,21 @@ void Application::StartListeningAudio() {
         return;
     }
 
+#if CONFIG_LAN_CONTROL_API
+    // The wake chime has no AEC on most boards. Opening the mic during it
+    // counts as speech, and the silence timer then uploads the ding before
+    // the user talks. Play it first and start the mic after playback drains.
+    if ((body_bridge::Enabled() || body_bridge::Session::GetInstance().IsCapturing()) &&
+        play_popup_on_listening_) {
+        play_popup_on_listening_ = false;
+        audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+        if (!audio_service_.IsPlaybackIdle()) {
+            pending_listening_start_ = true;
+            return;
+        }
+    }
+#endif
+
     // Cloud listen announces itself on the open channel. Body mode records
     // locally and must not send that, or a closed socket looks like a failure.
 #if CONFIG_LAN_CONTROL_API
@@ -1554,6 +1577,18 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
 }
 
 void Application::WakeWordInvoke(const std::string& wake_word) {
+#if CONFIG_LAN_CONTROL_API
+    if (body_bridge::Enabled()) {
+        // Button callbacks are not the main task. HandleBodyWakeWord starts
+        // the same local clip as a spoken wake word and must not enter connecting.
+        Schedule([this]() {
+            if (body_bridge::Enabled()) {
+                HandleBodyWakeWord();
+            }
+        });
+        return;
+    }
+#endif
     if (!protocol_) {
         return;
     }
