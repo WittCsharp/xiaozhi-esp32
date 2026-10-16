@@ -87,6 +87,17 @@ int main() {
     EXPECT(body_bridge::kPostSpeechSilenceUs == 600000);
     EXPECT(body_bridge::kPostSpeechSilenceUs >= 400000);
     EXPECT(body_bridge::kPostSpeechSilenceUs < 1000000);
+    EXPECT(body_bridge::kConversationIdleUs == 20000000ULL);
+    EXPECT(body_bridge::kConversationIdleUs >= 15000000ULL);
+    EXPECT(body_bridge::kConversationIdleUs <= 30000000ULL);
+    EXPECT(body_bridge::KeepsConversation("silence", true));
+    EXPECT(body_bridge::KeepsConversation("full", true));
+    EXPECT(body_bridge::KeepsConversation("timeout", true));
+    EXPECT(!body_bridge::KeepsConversation("silence", false));
+    EXPECT(!body_bridge::KeepsConversation("timeout", false));
+    EXPECT(!body_bridge::KeepsConversation("button", true));
+    EXPECT(!body_bridge::KeepsConversation("session", true));
+    EXPECT(!body_bridge::KeepsConversation(nullptr, true));
 
     int duration_ms = 0;
     const uint8_t silk20[] = {0x08, 0x00};

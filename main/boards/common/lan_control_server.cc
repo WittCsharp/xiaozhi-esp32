@@ -325,6 +325,8 @@ esp_err_t HealthHandler(httpd_req_t* req) {
     cJSON_AddBoolToObject(root.get(), "body_mode", body_bridge::Enabled());
     cJSON_AddStringToObject(root.get(), "bridge",
                             body_bridge::BridgeConfigured() ? "configured" : "missing");
+    cJSON_AddBoolToObject(root.get(), "conversation",
+                          Application::GetInstance().IsBodyConversationOpen());
     return SendJson(req, "200 OK", root.get());
 }
 
@@ -373,8 +375,12 @@ esp_err_t ModePostHandler(httpd_req_t* req) {
     }
     const bool enable = cJSON_IsTrue(body);
     const bool capturing = body_bridge::Session::GetInstance().IsCapturing();
+    const bool conversation = Application::GetInstance().IsBodyConversationOpen();
+    const DeviceState state = Application::GetInstance().GetDeviceState();
     body_bridge::SetEnabled(enable);
-    if (!enable && capturing) {
+    if (!enable &&
+        (capturing || conversation || body_downlink::IsActive() || state == kDeviceStateListening ||
+         state == kDeviceStateSpeaking || state == kDeviceStateNotifying)) {
         Application::GetInstance().Schedule([]() { Application::GetInstance().StopListening(); });
     }
     return SendModeStatus(req);

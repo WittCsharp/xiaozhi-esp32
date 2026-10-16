@@ -68,10 +68,10 @@ curl -sS "$DEVICE/api/notify" \
 `GET /api/health` returns `200`:
 
 ```json
-{"ok":true,"state":"idle","ip":"192.168.1.50","port":8080,"body_mode":false,"bridge":"missing"}
+{"ok":true,"state":"idle","ip":"192.168.1.50","port":8080,"body_mode":false,"bridge":"missing","conversation":false}
 ```
 
-`body_mode` is whether the wake word and BOOT record locally instead of opening cloud chat. Saying the compiled wake word starts that listen; BOOT is an optional start/stop. `bridge` is `configured` when a Mac bridge URL is stored, otherwise `missing`. See [Bot as brain](bot-as-brain.md).
+`body_mode` is whether the wake word and BOOT record locally instead of opening cloud chat. Saying the compiled wake word starts that listen; BOOT is an optional start/stop. `bridge` is `configured` when a Mac bridge URL is stored, otherwise `missing`. `conversation` is true while a body conversation is still open. See [Bot as brain](bot-as-brain.md) and [Conversation](#conversation).
 
 `POST /api/alert` calls `Application::Alert(status, message, emotion)` on the main loop and returns `200`. It updates the status line, emotion, and subtitle. It does not play the cloud alert vibration. `status`, `message`, and `emotion` are required, non-empty strings. Emotion names are the same ones the cloud sends, such as `neutral`, `happy`, and `sad`. Unknown names are still forwarded to the display.
 
@@ -151,7 +151,7 @@ The device replies with a text frame:
 {"ok":true,"event":"playing","playback_id":1}
 ```
 
-Binary frames after that are played immediately. There is no popup chime on this path. `{"event":"end"}` means no more audio; the device answers `{"ok":true,"event":"ended"}` and stays in `speaking` until the queued audio drains, then returns to `idle`. Closing the socket after `playing` is the same as `end`: the tail still plays. Poll `/api/health`. `{"event":"abort"}`, a bad frame, or a wake word drops the tail. A wake word then starts a local listen.
+Binary frames after that are played immediately. There is no popup chime on this path. `{"event":"end"}` means no more audio; the device answers `{"ok":true,"event":"ended"}` and stays in `speaking` until the queued audio drains. With no conversation open, it then returns to `idle`. With a conversation open, it listens for the next turn. See [Conversation](#conversation). Closing the socket after `playing` is the same as `end`: the tail still plays. Poll `/api/health`. `{"event":"abort"}`, a bad frame, or a wake word drops the tail. A wake word then starts a local listen.
 
 Busy, body mode off, and a bad frame are text errors, then the socket closes:
 
@@ -229,7 +229,30 @@ curl -sS -X POST "$DEVICE/api/bridge" \
 
 NVS keys, all in `lan_api`: `body_mode`, `bot_bridge_url`, and `bridge_token`. The token key is not `bot_bridge_token` because an NVS key is at most 15 characters. When `body_mode` has never been written, Kconfig `BODY_MODE_DEFAULT` applies (off unless you turn it on).
 
-Turning body mode off while the device is in a local listen stops that listen. The next BOOT uses cloud chat again.
+Turning body mode off while the device is in a local listen, or while a conversation is open, stops that conversation. The next BOOT uses cloud chat again.
+
+## Conversation
+
+With body mode on and a bridge URL stored, one wake word opens a conversation. The device uploads the clip and waits for `/api/speak` or `/api/notify`. When that playback finishes, it listens again with no wake chime. The next sentence is a new clip. `source` on the uplink is `followup`. This repeats until the conversation ends.
+
+Cloud Q&A stays off for the whole conversation. The device does not open the cloud audio channel.
+
+The idle window is `CONFIG_BODY_CONVERSATION_IDLE_MS` (menuconfig: **Xiaozhi Assistant → LAN Control API → Body conversation idle window**). The default is 20000 ms. The range is 15000–30000. It is how long the device waits in two places:
+
+| Wait | What you see | What ends it |
+| --- | --- | --- |
+| After the clip is uploaded | `"state":"idle"` and `"conversation":true`. The face shows thinking. `/api/speak` and `/api/notify` can start | A reply starts, or the window expires |
+| After the reply finishes | `"state":"listening"`. The mic is open and there is no wake chime | Speech, or the window with no speech |
+
+Speech still ends one clip about 0.6 s after local VAD goes quiet. One utterance is still capped at about 8 s and 32 KB. Those limits upload the clip and leave the conversation open for the reply. The 8 s cap starts when speech begins on a follow-up listen, so the idle window can elapse first.
+
+If the follow-up window expires with no speech, the device sends `listen_stop` with `"reason":"session"` and does not post an audio body or an `utterance`. It returns to standby. `"conversation"` becomes false. The next sentence needs the wake word again.
+
+BOOT ends an open conversation: it stops the current clip or playback and returns to standby. From standby, BOOT still starts one clip. A second BOOT during that clip stops it. Turning body mode off ends the conversation the same way.
+
+A follow-up listen keeps a short preroll and drops earlier silence, so the open mic does not upload an empty clip or hit the 32 KB cap while it waits.
+
+`source` is `wake`, `button`, or `followup`. `reason` on `utterance` and `listen_stop` is `button`, `silence`, `timeout`, `full`, or `session`.
 
 ## Servo stub
 
