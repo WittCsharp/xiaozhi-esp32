@@ -5,14 +5,16 @@ Body mode makes the device a microphone, speaker, and face. A computer on the sa
 Downlink is the existing [LAN control API](lan-control.md): `POST /api/alert` and `POST /api/notify`. This page is the uplink. The board has no onboard TTS. The Mac synthesizes speech with `scripts/lan_control/mac_speak.py`.
 
 ```text
-BOOT or wake
-    -> device records Opus locally (no cloud socket)
+wake word (BOOT is an optional start/stop)
+    -> chime, then the device records Opus locally (no cloud socket)
     -> POST {bridge}/body/event and {bridge}/body/audio
     -> Mac bridge (ASR and the Bot are still TODO)
     -> mac_speak.py -> POST /api/alert and POST /api/notify
 ```
 
-Wake-word language defaults are unchanged. RoboEyes and other face drawing are unchanged. The feature is compiled only when `CONFIG_LAN_CONTROL_API` is on, so boards built without that option keep the previous BOOT path.
+The spoken wake word is the normal way to start a clip. It calls `BeginBodyListen("wake")` and does not open cloud chat. The mic stays closed while the wake chime plays, so that sound is not treated as the utterance. BOOT still starts or stops a clip, and is not required.
+
+Wake-word language defaults are unchanged. An en-US build still listens for "Hi ESP" (`wn9_hiesp` on ESP32-S3). RoboEyes and other face drawing are unchanged. The feature is compiled only when `CONFIG_LAN_CONTROL_API` is on, so boards built without that option keep the previous BOOT path.
 
 ## Flash once
 
@@ -63,17 +65,29 @@ curl -sS -X POST "$DEVICE/api/mode" \
   -d '{"body":false}'
 ```
 
-## BOOT test
+## Wake word on the flash
+
+This change does not switch the board to Chinese. `scripts/build.py` picks the model from the language: en-US and every language other than zh-CN/zh-TW use "Hi ESP". zh-CN and zh-TW use 「你好小智」. Board `config.json` must not pin the model.
+
+Say the phrase that was compiled in. A default en-US build listens for **Hi ESP**. To bake 「你好小智」 and keep the English UI:
+
+```bash
+python3 scripts/build.py bread-compact-wifi-lcd --wake-word nihaoxiaozhi
+```
+
+`--language zh-CN` changes both the UI strings and the wake word. Keep `CONFIG_LAN_CONTROL_API` in the variant `sdkconfig_append`, as in [lan-control.md](lan-control.md). The committed `bread-compact-wifi-lcd` variant still selects the ST7789 panel. A GC9A01 circle needs **Xiaozhi Assistant → LCD Type → GC9A01 240*240 Circle** (`CONFIG_LCD_GC9A01_240X240=y`) in place of that ST7789 line. This patch does not change that default.
+
+## Listen test
 
 1. Leave the device idle. The face should say standby, not connecting.
-2. Press BOOT once. The device shows listening. It must not open the cloud conversation. The bridge logs `event listen_start`.
-3. Speak a short sentence, then press BOOT again. Silence for about one second after speech, or eight seconds, also ends the clip.
+2. Say the compiled wake word. The face shows listening and plays the short chime. It must not open the cloud conversation. The bridge logs `event listen_start` with `"source":"wake"`.
+3. After the chime, speak a short sentence. Silence for about one second after speech, or eight seconds, ends the clip. A second BOOT press also ends it.
 4. The bridge logs the Opus byte count and frame count, then prints a `mac_speak.py` command. The device shows emotion `thinking` and returns to idle so a notification can play.
 5. Run that command (or start the bridge with `--reply "Hello from the bridge"`). The device should play it through `/api/notify` and show the emotion through `/api/alert`.
 
-Wake does the same local capture when body mode is on, so a wake word does not open cloud chat either. Hold-to-talk boards use the same path: press starts the clip, release uploads it.
+BOOT does the same local capture without the chime: press once to start, press again to stop. Hold-to-talk boards use that button path too: press starts the clip, release uploads it.
 
-If the bridge URL is missing, BOOT still does not open cloud chat. The screen says to set the bridge URL.
+If the bridge URL is missing, the wake word and BOOT still do not open cloud chat. The screen says to set the bridge URL.
 
 ## What the device sends
 

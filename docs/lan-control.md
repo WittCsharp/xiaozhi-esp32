@@ -67,7 +67,7 @@ curl -sS "$DEVICE/api/notify" \
 {"ok":true,"state":"idle","ip":"192.168.1.50","port":8080,"body_mode":false,"bridge":"missing"}
 ```
 
-`body_mode` is whether BOOT and wake skip cloud chat. `bridge` is `configured` when a Mac bridge URL is stored, otherwise `missing`. See [Bot as brain](bot-as-brain.md).
+`body_mode` is whether the wake word and BOOT record locally instead of opening cloud chat. Saying the compiled wake word starts that listen; BOOT is an optional start/stop. `bridge` is `configured` when a Mac bridge URL is stored, otherwise `missing`. See [Bot as brain](bot-as-brain.md).
 
 `POST /api/alert` calls `Application::Alert(status, message, emotion)` on the main loop and returns `200`. It updates the status line, emotion, and subtitle. It does not play the cloud alert vibration. `status`, `message`, and `emotion` are required, non-empty strings. Emotion names are the same ones the cloud sends, such as `neutral`, `happy`, and `sad`. Unknown names are still forwarded to the display.
 
