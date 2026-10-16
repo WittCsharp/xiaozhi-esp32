@@ -62,6 +62,12 @@ Application::~Application() {
         esp_timer_stop(startup_wake_word_hint_timer_);
         esp_timer_delete(startup_wake_word_hint_timer_);
     }
+#if CONFIG_LAN_CONTROL_API
+    if (body_conversation_timer_ != nullptr) {
+        esp_timer_stop(body_conversation_timer_);
+        esp_timer_delete(body_conversation_timer_);
+    }
+#endif
     vEventGroupDelete(event_group_);
 }
 
@@ -191,7 +197,8 @@ void Application::Run() {
         MAIN_EVENT_VAD_CHANGE | MAIN_EVENT_CLOCK_TICK | MAIN_EVENT_ERROR |
         MAIN_EVENT_NETWORK_CONNECTED | MAIN_EVENT_NETWORK_DISCONNECTED | MAIN_EVENT_TOGGLE_CHAT |
         MAIN_EVENT_START_LISTENING | MAIN_EVENT_STOP_LISTENING | MAIN_EVENT_ACTIVATION_DONE |
-        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED | MAIN_EVENT_STARTUP_HINT_TIMEOUT;
+        MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED | MAIN_EVENT_STARTUP_HINT_TIMEOUT |
+        MAIN_EVENT_BODY_CONVERSATION;
 
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
@@ -308,6 +315,11 @@ void Application::Run() {
         if (bits & MAIN_EVENT_STARTUP_HINT_TIMEOUT) {
             HideStartupWakeWordHint();
         }
+#if CONFIG_LAN_CONTROL_API
+        if (bits & MAIN_EVENT_BODY_CONVERSATION) {
+            OnBodyConversationTimeout();
+        }
+#endif
         ShowStartupWakeWordHint();
     }
 }
@@ -348,8 +360,13 @@ void Application::HandleNetworkDisconnectedEvent() {
     if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
         state == kDeviceStateSpeaking) {
 #if CONFIG_LAN_CONTROL_API
-        if (body_downlink::IsActive()) {
-            Schedule([this]() { AbortBodySpeak(); });
+        if (body_downlink::IsActive() || IsBodyConversationOpen()) {
+            Schedule([this]() {
+                if (body_downlink::IsActive() || GetDeviceState() == kDeviceStateSpeaking) {
+                    AbortBodySpeak();
+                }
+                CloseBodyConversation();
+            });
         }
         if (body_bridge::Session::GetInstance().IsCapturing()) {
             ESP_LOGI(TAG, "Network lost during body listen; keeping local capture");
@@ -362,6 +379,14 @@ void Application::HandleNetworkDisconnectedEvent() {
             protocol_->CloseAudioChannel();
         }
     }
+#if CONFIG_LAN_CONTROL_API
+    // Thinking idle is not listening or speaking. Drop the open conversation
+    // so a lost network does not leave the mic window running.
+    if (IsBodyConversationOpen() && GetDeviceState() == kDeviceStateIdle &&
+        !body_bridge::Session::GetInstance().IsCapturing()) {
+        Schedule([this]() { CloseBodyConversation(); });
+    }
+#endif
 
     // Update the status bar immediately to show the network state
     auto display = Board::GetInstance().GetDisplay();
@@ -872,6 +897,7 @@ bool Application::BeginBodySpeak() {
         body_downlink::CompleteStart(body_downlink::StartStatus::kBusy);
         return false;
     }
+    DisarmBodyConversationIdle();
     // Decoder reset runs in the speaking state handler, which then accepts audio.
     return true;
 }
@@ -886,6 +912,10 @@ void Application::AbortBodySpeak() {
     if (GetDeviceState() == kDeviceStateSpeaking) {
         SetDeviceState(kDeviceStateIdle);
     }
+    if (IsBodyConversationOpen() && GetDeviceState() == kDeviceStateIdle &&
+        !body_bridge::Session::GetInstance().IsCapturing()) {
+        ArmBodyConversationIdle();
+    }
 }
 
 void Application::BeginBodyListen(const char* source) {
@@ -893,13 +923,27 @@ void Application::BeginBodyListen(const char* source) {
     if (session.IsCapturing()) {
         return;
     }
+    const bool followup = source != nullptr && std::strcmp(source, "followup") == 0;
+    if (body_bridge::Enabled() && body_bridge::BridgeConfigured()) {
+        OpenBodyConversation();
+    }
+    DisarmBodyConversationIdle();
     // Mark the session before closing a cloud socket. The close callback
     // returns the device to idle, and it bails out while a body capture is active.
-    if (!session.Begin(source, [this](const char* reason) {
-            std::string why(reason != nullptr ? reason : "timeout");
-            Schedule([this, why]() { EndBodyListen(why.c_str()); });
-        })) {
+    // Follow-up keeps the mic open for the conversation window before speech,
+    // then applies the 8 s cap once the user talks.
+    const uint64_t pre_speech_us = followup ? body_bridge::kConversationIdleUs : 0;
+    if (!session.Begin(
+            source,
+            [this](const char* reason) {
+                std::string why(reason != nullptr ? reason : "timeout");
+                Schedule([this, why]() { EndBodyListen(why.c_str()); });
+            },
+            pre_speech_us)) {
         play_popup_on_listening_ = false;
+        if (IsBodyConversationOpen() && GetDeviceState() == kDeviceStateIdle) {
+            ArmBodyConversationIdle();
+        }
         return;
     }
     if (protocol_ != nullptr && protocol_->IsAudioChannelOpened()) {
@@ -911,6 +955,9 @@ void Application::BeginBodyListen(const char* source) {
         play_popup_on_listening_ = false;
         session.Cancel();
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        if (IsBodyConversationOpen() && GetDeviceState() == kDeviceStateIdle) {
+            ArmBodyConversationIdle();
+        }
         ESP_LOGW(TAG, "Body listen rejected");
         return;
     }
@@ -918,17 +965,34 @@ void Application::BeginBodyListen(const char* source) {
 }
 
 void Application::EndBodyListen(const char* reason) {
-    const body_bridge::ClipResult result = body_bridge::Session::GetInstance().Finish(reason);
+    auto& session = body_bridge::Session::GetInstance();
+    if (!session.IsCapturing()) {
+        return;
+    }
+    const bool heard = session.HeardVoice();
+    const body_bridge::ClipResult result = session.Finish(reason);
     if (result == body_bridge::ClipResult::kNotCapturing) {
         return;
+    }
+    const bool spoke = body_bridge::KeepsConversation(reason, heard) ||
+                       (heard && reason != nullptr && std::strcmp(reason, "session") == 0);
+    const bool keep = IsBodyConversationOpen() && body_bridge::Enabled() &&
+                      body_bridge::BridgeConfigured() &&
+                      result == body_bridge::ClipResult::kQueued && spoke;
+    if (!keep) {
+        CloseBodyConversation();
     }
     Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
     if (GetDeviceState() == kDeviceStateListening) {
         SetDeviceState(kDeviceStateIdle);
     }
+    if (keep) {
+        ArmBodyConversationIdle();
+    }
     const bool missing = result == body_bridge::ClipResult::kNoBridge;
     const bool failed = result == body_bridge::ClipResult::kUploadFailed;
-    Schedule([this, missing, failed]() {
+    const bool show_thinking = keep || (heard && !missing && !failed);
+    Schedule([this, missing, failed, show_thinking, keep]() {
         if (GetDeviceState() != kDeviceStateIdle) {
             return;
         }
@@ -945,11 +1009,115 @@ void Application::EndBodyListen(const char* reason) {
             display->SetChatMessage("system", "Bridge upload failed");
             return;
         }
+        // BOOT can close the conversation before this UI update runs.
+        if (!show_thinking || (keep && !IsBodyConversationOpen())) {
+            return;
+        }
         display->SetStatus("Thinking");
         display->SetEmotion("thinking");
         display->SetChatMessage("system", "");
     });
     ESP_LOGI(TAG, "Body listen stopped (%s)", reason != nullptr ? reason : "");
+}
+
+void Application::EnsureBodyConversationTimer() {
+    if (body_conversation_timer_ != nullptr) {
+        return;
+    }
+    esp_timer_create_args_t args = {
+        .callback =
+            [](void* arg) {
+                auto* app = static_cast<Application*>(arg);
+                xEventGroupSetBits(app->event_group_, MAIN_EVENT_BODY_CONVERSATION);
+            },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "body_conv",
+        .skip_unhandled_events = true,
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&args, &body_conversation_timer_));
+}
+
+void Application::OpenBodyConversation() {
+    if (body_conversation_open_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    ESP_LOGI(TAG, "Body conversation open");
+}
+
+void Application::CloseBodyConversation() {
+    DisarmBodyConversationIdle();
+    if (!body_conversation_open_.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    ESP_LOGI(TAG, "Body conversation ended");
+    if (GetDeviceState() == kDeviceStateIdle && last_error_message_.empty()) {
+        auto* display = Board::GetInstance().GetDisplay();
+        display->SetStatus(Lang::Strings::STANDBY);
+        display->SetEmotion("neutral");
+        display->ClearChatMessages();
+    }
+}
+
+void Application::ArmBodyConversationIdle() {
+    if (!IsBodyConversationOpen()) {
+        return;
+    }
+    EnsureBodyConversationTimer();
+    (void)esp_timer_stop(body_conversation_timer_);
+    if (esp_timer_start_once(body_conversation_timer_, body_bridge::kConversationIdleUs) !=
+        ESP_OK) {
+        ESP_LOGW(TAG, "Failed to arm body conversation timer");
+    }
+}
+
+void Application::DisarmBodyConversationIdle() {
+    if (body_conversation_timer_ != nullptr) {
+        (void)esp_timer_stop(body_conversation_timer_);
+    }
+}
+
+void Application::OnBodyConversationTimeout() {
+    if (!IsBodyConversationOpen() || GetDeviceState() != kDeviceStateIdle) {
+        return;
+    }
+    if (body_bridge::Session::GetInstance().IsCapturing() || body_downlink::IsActive()) {
+        return;
+    }
+    ESP_LOGI(TAG, "Body conversation idle timeout");
+    CloseBodyConversation();
+}
+
+bool Application::ContinueBodyConversation() {
+    if (!IsBodyConversationOpen() || !body_bridge::Enabled() || !body_bridge::BridgeConfigured()) {
+        return false;
+    }
+    const DeviceState state = GetDeviceState();
+    if (state != kDeviceStateIdle && state != kDeviceStateSpeaking) {
+        return false;
+    }
+    if (body_bridge::Session::GetInstance().IsCapturing() || body_downlink::IsActive()) {
+        return false;
+    }
+    play_popup_on_listening_ = false;
+    BeginBodyListen("followup");
+    return body_bridge::Session::GetInstance().IsCapturing();
+}
+
+void Application::OnBodyReplyFinished() {
+    if (GetDeviceState() != kDeviceStateSpeaking) {
+        return;
+    }
+    if (ContinueBodyConversation()) {
+        return;
+    }
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    if (GetDeviceState() == kDeviceStateSpeaking) {
+        SetDeviceState(kDeviceStateIdle);
+    }
+    if (IsBodyConversationOpen() && GetDeviceState() == kDeviceStateIdle) {
+        ArmBodyConversationIdle();
+    }
 }
 
 void Application::HandleBodyWakeWord() {
@@ -1033,6 +1201,12 @@ void Application::HandleToggleChatEvent() {
         if (body_downlink::IsActive() || state == kDeviceStateSpeaking) {
             AbortSpeaking(kAbortReasonNone);
             AbortBodySpeak();
+            CloseBodyConversation();
+        } else if (IsBodyConversationOpen()) {
+            CloseBodyConversation();
+            if (state == kDeviceStateListening) {
+                SetDeviceState(kDeviceStateIdle);
+            }
         } else if (state == kDeviceStateIdle) {
             BeginBodyListen("button");
         } else if (state == kDeviceStateListening && protocol_ != nullptr) {
@@ -1151,7 +1325,11 @@ void Application::HandleStopListeningEvent() {
     }
     if (body_downlink::IsActive()) {
         AbortBodySpeak();
+        CloseBodyConversation();
         return;
+    }
+    if (IsBodyConversationOpen()) {
+        CloseBodyConversation();
     }
 #endif
     auto state = GetDeviceState();
@@ -1448,6 +1626,11 @@ void Application::StartListeningAudio() {
             return;
         }
     }
+    if ((body_bridge::Enabled() || body_bridge::Session::GetInstance().IsCapturing()) &&
+        !audio_service_.IsPlaybackIdle()) {
+        pending_listening_start_ = true;
+        return;
+    }
 #endif
 
     // Cloud listen announces itself on the open channel. Body mode records
@@ -1506,6 +1689,9 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         return;
     }
+#if CONFIG_LAN_CONTROL_API
+    DisarmBodyConversationIdle();
+#endif
 
     audio_service_.ResetDecoder();
     uint32_t playback_id = ++notification_playback_id_;
@@ -1530,6 +1716,11 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
     if (!started) {
         ESP_LOGE(TAG, "Failed to start notification playback");
         StopNotification();
+#if CONFIG_LAN_CONTROL_API
+        if (IsBodyConversationOpen() && GetDeviceState() == kDeviceStateIdle) {
+            ArmBodyConversationIdle();
+        }
+#endif
     }
 }
 
@@ -1551,6 +1742,14 @@ void Application::HandleNotificationFinished(uint32_t playback_id, bool success)
     ESP_LOGI(TAG, "Notification playback %lu %s", static_cast<unsigned long>(playback_id),
              success ? "completed" : "failed");
     StopNotification();
+#if CONFIG_LAN_CONTROL_API
+    if (ContinueBodyConversation()) {
+        return;
+    }
+    if (IsBodyConversationOpen() && GetDeviceState() == kDeviceStateIdle) {
+        ArmBodyConversationIdle();
+    }
+#endif
 }
 
 void Application::Schedule(std::function<void()>&& callback) {
@@ -1702,6 +1901,11 @@ bool Application::CanEnterSleepMode() {
     if (GetDeviceState() != kDeviceStateIdle) {
         return false;
     }
+#if CONFIG_LAN_CONTROL_API
+    if (IsBodyConversationOpen()) {
+        return false;
+    }
+#endif
 
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
         return false;

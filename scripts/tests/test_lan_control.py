@@ -217,6 +217,8 @@ class LanControlWiringTests(unittest.TestCase):
         self.assertIn('default ""', kconfig)
         self.assertIn("lan_api", kconfig)
         self.assertIn("config BODY_MODE_DEFAULT", kconfig)
+        self.assertIn("config BODY_CONVERSATION_IDLE_MS", kconfig)
+        self.assertIn("range 15000 30000", kconfig)
         self.assertIn("HTTPD_WS_SUPPORT", kconfig)
         self.assertIn("BeginBodySpeak", app)
         self.assertIn("Ignoring cloud tts in body mode", app)
@@ -263,6 +265,25 @@ class LanControlWiringTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("kPostSpeechSilenceUs = 600000", uplink_header)
+        self.assertIn("kConversationIdleUs = 20000000ULL", uplink_header)
+        self.assertIn("KeepsConversation", uplink_header)
+        self.assertIn('BeginBodyListen("followup")', app)
+        self.assertIn("OnBodyReplyFinished", app)
+        self.assertIn("CloseBodyConversation", app)
+        self.assertIn("kConversationIdleUs", app)
+        reply = _definition(app, "void Application::OnBodyReplyFinished()")
+        self.assertIn("ContinueBodyConversation", reply)
+        self.assertNotIn("OpenAudioChannel", reply)
+        follow = _definition(app, "bool Application::ContinueBodyConversation()")
+        self.assertIn('BeginBodyListen("followup")', follow)
+        self.assertNotIn("OpenAudioChannel", follow)
+        toggle = _definition(app, "void Application::HandleToggleChatEvent()")
+        self.assertIn("CloseBodyConversation", toggle)
+        self.assertIn("IsBodyConversationOpen", toggle)
+        server = (ROOT / "main" / "boards" / "common" / "lan_control_server.cc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"conversation"', server)
 
 
 def _definition(source, signature):

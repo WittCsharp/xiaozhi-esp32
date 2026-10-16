@@ -1219,6 +1219,18 @@ menu "LAN Control API"
             POST mic audio to the Mac bridge instead. NVS namespace "lan_api",
             key "body_mode", overrides this after the first /api/mode call.
             Leave this off so cloud chat stays the default.
+
+    config BODY_CONVERSATION_IDLE_MS
+        int "Body conversation idle window (ms)"
+        depends on LAN_CONTROL_API
+        range 15000 30000
+        default 20000
+        help
+            After a wake word, body mode keeps the conversation open. This is
+            how long the device waits for a bridge reply, and how long the mic
+            stays open after that reply when nobody is speaking. Then it
+            returns to standby and the wake word is required again. 20000 is
+            20 seconds. BOOT ends the conversation sooner.
 endmenu
 
 endmenu

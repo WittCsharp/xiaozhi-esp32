@@ -1,25 +1,26 @@
 #ifndef _APPLICATION_H_
 #define _APPLICATION_H_
 
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 #include <freertos/task.h>
-#include <esp_timer.h>
 
-#include <string>
-#include <mutex>
-#include <deque>
-#include <memory>
-#include <functional>
+#include <atomic>
 #include <cstdint>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <vector>
 
-#include "protocol.h"
-#include "ota.h"
 #include "audio_service.h"
 #include "device_state.h"
 #include "device_state_machine.h"
 #include "notify/notify_player.h"
+#include "ota.h"
+#include "protocol.h"
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -37,6 +38,7 @@
 #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
 #define MAIN_EVENT_PLAYBACK_DRAINED     (1 << 13)
 #define MAIN_EVENT_STARTUP_HINT_TIMEOUT (1 << 14)
+#define MAIN_EVENT_BODY_CONVERSATION    (1 << 15)
 
 enum AecMode {
     kAecOff,
@@ -70,7 +72,7 @@ public:
 
     DeviceState GetDeviceState() const { return state_machine_.GetState(); }
     bool IsVoiceDetected() const { return audio_service_.IsVoiceDetected(); }
-    
+
     /**
      * Request state transition
      * Returns true if transition was successful
@@ -101,6 +103,12 @@ public:
     // Begin enters Speaking without opening cloud chat. Abort stops that playback.
     bool BeginBodySpeak();
     void AbortBodySpeak();
+    // Main loop. A finished /api/speak stream re-opens the mic when a body
+    // conversation is still running.
+    void OnBodyReplyFinished();
+    bool IsBodyConversationOpen() const {
+        return body_conversation_open_.load(std::memory_order_acquire);
+    }
 #endif
 
     void AbortSpeaking(AbortReason reason);
@@ -133,7 +141,7 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
-    
+
     /**
      * Reset protocol resources (thread-safe)
      * Can be called from any task to release resources allocated after network connected
@@ -173,7 +181,6 @@ private:
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
-
     // Event handlers
     void HandleStateChangedEvent();
     void HandleToggleChatEvent();
@@ -188,6 +195,16 @@ private:
     void BeginBodyListen(const char* source);
     void EndBodyListen(const char* reason);
     bool RouteBodyUplink();
+    void OpenBodyConversation();
+    void CloseBodyConversation();
+    void ArmBodyConversationIdle();
+    void DisarmBodyConversationIdle();
+    void OnBodyConversationTimeout();
+    bool ContinueBodyConversation();
+    void EnsureBodyConversationTimer();
+
+    std::atomic<bool> body_conversation_open_{false};
+    esp_timer_handle_t body_conversation_timer_ = nullptr;
 #endif
     void ContinueOpenAudioChannel(ListeningMode mode);
     void BeginWakeWordInvoke(const std::string& wake_word);
@@ -210,11 +227,10 @@ private:
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;
-    
+
     // State change handler called by state machine
     void OnStateChanged(DeviceState old_state, DeviceState new_state);
 };
-
 
 class TaskPriorityReset {
 public:

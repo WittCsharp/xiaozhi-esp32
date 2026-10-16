@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "body_uplink_format.h"
 #include "protocol.h"
 
 // Body mode: the device is a mic/speaker/face, and a Mac bridge is the brain.
@@ -30,8 +31,8 @@ bool SetBridge(const std::string& url, const std::string* token);
 
 enum class ClipResult { kNotCapturing, kNoBridge, kQueued, kUploadFailed };
 
-// Mic capture for one BOOT or wake. Touch this from the main loop only, except
-// IsCapturing/ClipId which are safe from the HTTP task and esp_timer.
+// Mic capture for one clip. Touch this from the main loop only, except
+// IsCapturing/ClipId/HeardVoice which are safe from the HTTP task and esp_timer.
 class Session {
 public:
     static Session& GetInstance();
@@ -41,8 +42,11 @@ public:
     bool IsCapturing() const;
     uint32_t ClipId() const;
 
-    // source is "button" or "wake". on_stop runs on the esp_timer task.
-    bool Begin(const char* source, StopCallback on_stop);
+    // source is "button", "wake", or "followup". on_stop runs on the esp_timer task.
+    // pre_speech_us > 0 waits that long for speech, then stops with "session".
+    // The 8 s cap starts when speech begins. 0 keeps the 8 s cap from Begin.
+    bool Begin(const char* source, StopCallback on_stop, uint64_t pre_speech_us = 0);
+    bool HeardVoice() const;
     void OnVad(bool speaking);
     // False when the clip is full and the caller should finish it.
     bool Accept(std::unique_ptr<AudioStreamPacket> packet);
@@ -56,21 +60,26 @@ private:
     void StopTimers();
     void ArmSilenceTimer();
     void DisarmSilenceTimer();
+    void ArmPreSpeechTimer(uint64_t us);
+    void ArmMaxTimer();
     void Fire(const char* reason);
 
     mutable std::mutex mutex_;
     bool capturing_ = false;
     bool heard_voice_ = false;
     bool pause_notified_ = false;
+    bool defer_max_ = false;
     StopCallback on_stop_;
     std::string source_;
     std::vector<uint8_t> audio_;
+    std::vector<std::vector<uint8_t>> preroll_;
     int frames_ = 0;
     int sample_rate_ = 16000;
     int frame_ms_ = 60;
     uint32_t clip_id_ = 0;
     esp_timer_handle_t max_timer_ = nullptr;
     esp_timer_handle_t silence_timer_ = nullptr;
+    esp_timer_handle_t prespeech_timer_ = nullptr;
 };
 
 }  // namespace body_bridge

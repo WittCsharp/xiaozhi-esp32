@@ -259,10 +259,7 @@ public:
             accepting_ = false;
         }
         ESP_LOGI(TAG, "Speak stream finished");
-        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
-        if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) {
-            Application::GetInstance().SetDeviceState(kDeviceStateIdle);
-        }
+        Application::GetInstance().OnBodyReplyFinished();
     }
 
 private:

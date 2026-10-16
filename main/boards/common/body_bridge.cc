@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <string>
 #include <utility>
@@ -35,6 +36,7 @@ constexpr int kHttpTimeoutMs = 8000;
 constexpr uint32_t kUploadStackBytes = 8192;
 constexpr uint64_t kMaxListenUs = 8ULL * 1000ULL * 1000ULL;
 constexpr size_t kMaxQueuedJobs = 8;
+constexpr size_t kPrerollFrames = 8;
 
 static_assert(sizeof("body_mode") - 1 <= 15, "NVS key too long");
 static_assert(sizeof("bot_bridge_url") - 1 <= 15, "NVS key too long");
@@ -348,11 +350,22 @@ void Session::EnsureTimers() {
         };
         ESP_ERROR_CHECK(esp_timer_create(&args, &silence_timer_));
     }
+    if (prespeech_timer_ == nullptr) {
+        esp_timer_create_args_t args = {
+            .callback = [](void* arg) { static_cast<Session*>(arg)->Fire("session"); },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "body_pre",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&args, &prespeech_timer_));
+    }
 }
 
 void Session::StopTimers() {
     StopTimer(max_timer_);
     StopTimer(silence_timer_);
+    StopTimer(prespeech_timer_);
 }
 
 void Session::ArmSilenceTimer() {
@@ -365,11 +378,31 @@ void Session::ArmSilenceTimer() {
 
 void Session::DisarmSilenceTimer() { StopTimer(silence_timer_); }
 
+void Session::ArmPreSpeechTimer(uint64_t us) {
+    EnsureTimers();
+    (void)esp_timer_stop(prespeech_timer_);
+    if (esp_timer_start_once(prespeech_timer_, us) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to arm body pre-speech timer");
+    }
+}
+
+void Session::ArmMaxTimer() {
+    EnsureTimers();
+    (void)esp_timer_stop(max_timer_);
+    if (esp_timer_start_once(max_timer_, kMaxListenUs) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to arm body listen timer");
+    }
+}
+
 void Session::Fire(const char* reason) {
     StopCallback callback;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!capturing_) {
+            return;
+        }
+        // Speech already started; a stale pre-speech timeout must not drop it.
+        if (reason != nullptr && std::strcmp(reason, "session") == 0 && heard_voice_) {
             return;
         }
         callback = on_stop_;
@@ -379,7 +412,12 @@ void Session::Fire(const char* reason) {
     }
 }
 
-bool Session::Begin(const char* source, StopCallback on_stop) {
+bool Session::HeardVoice() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return capturing_ && heard_voice_;
+}
+
+bool Session::Begin(const char* source, StopCallback on_stop, uint64_t pre_speech_us) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (capturing_) {
@@ -388,18 +426,21 @@ bool Session::Begin(const char* source, StopCallback on_stop) {
         capturing_ = true;
         heard_voice_ = false;
         pause_notified_ = false;
+        defer_max_ = pre_speech_us > 0;
         source_ = source != nullptr ? source : "button";
         on_stop_ = std::move(on_stop);
         audio_.clear();
+        preroll_.clear();
         frames_ = 0;
         sample_rate_ = 16000;
         frame_ms_ = 60;
     }
     EnsureTimers();
-    (void)esp_timer_stop(max_timer_);
-    (void)esp_timer_stop(silence_timer_);
-    if (esp_timer_start_once(max_timer_, kMaxListenUs) != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to arm body listen timer");
+    StopTimers();
+    if (pre_speech_us > 0) {
+        ArmPreSpeechTimer(pre_speech_us);
+    } else {
+        ArmMaxTimer();
     }
     std::string source_copy;
     uint32_t clip_id = 0;
@@ -416,6 +457,7 @@ void Session::OnVad(bool speaking) {
     bool arm = false;
     bool disarm = false;
     bool notify_pause = false;
+    bool start_max = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!capturing_) {
@@ -424,6 +466,10 @@ void Session::OnVad(bool speaking) {
         if (speaking) {
             heard_voice_ = true;
             disarm = true;
+            if (defer_max_) {
+                defer_max_ = false;
+                start_max = true;
+            }
         } else if (heard_voice_) {
             arm = true;
             if (!pause_notified_) {
@@ -434,6 +480,10 @@ void Session::OnVad(bool speaking) {
     }
     if (disarm) {
         DisarmSilenceTimer();
+        if (start_max) {
+            StopTimer(prespeech_timer_);
+            ArmMaxTimer();
+        }
     } else if (arm) {
         ArmSilenceTimer();
         if (notify_pause) {
@@ -467,17 +517,39 @@ bool Session::Accept(std::unique_ptr<AudioStreamPacket> packet) {
     if (!capturing_) {
         return true;
     }
-    const uint8_t* data = packet->payload.empty() ? nullptr : packet->payload.data();
-    if (!AppendOpusFrame(audio_, data, packet->payload.size(), kMaxBodyClipBytes)) {
-        return false;
-    }
-    frames_ += 1;
     if (packet->sample_rate > 0) {
         sample_rate_ = packet->sample_rate;
     }
     if (packet->frame_duration > 0) {
         frame_ms_ = packet->frame_duration;
     }
+    // A follow-up listen can sit open for the whole conversation window.
+    // Keep a short preroll and drop the rest until VAD hears speech, or the
+    // 32 KB cap would upload silence and end the turn early.
+    if (!heard_voice_ && defer_max_) {
+        if (!packet->payload.empty()) {
+            preroll_.push_back(packet->payload);
+            if (preroll_.size() > kPrerollFrames) {
+                preroll_.erase(preroll_.begin());
+            }
+        }
+        return true;
+    }
+    if (!preroll_.empty()) {
+        for (const auto& frame : preroll_) {
+            if (!AppendOpusFrame(audio_, frame.data(), frame.size(), kMaxBodyClipBytes)) {
+                preroll_.clear();
+                return false;
+            }
+            frames_ += 1;
+        }
+        preroll_.clear();
+    }
+    const uint8_t* data = packet->payload.empty() ? nullptr : packet->payload.data();
+    if (!AppendOpusFrame(audio_, data, packet->payload.size(), kMaxBodyClipBytes)) {
+        return false;
+    }
+    frames_ += 1;
     return true;
 }
 
@@ -488,6 +560,7 @@ ClipResult Session::Finish(const char* reason) {
     int sample_rate = 16000;
     int frame_ms = 60;
     uint32_t clip_id = 0;
+    bool session_idle = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!capturing_) {
@@ -495,12 +568,23 @@ ClipResult Session::Finish(const char* reason) {
         }
         capturing_ = false;
         on_stop_ = nullptr;
+        defer_max_ = false;
         source = source_;
+        // Idle follow-up: listen_stop closes listen_start, and there is no
+        // utterance for the bridge to answer.
+        session_idle = !heard_voice_ && reason != nullptr && std::strcmp(reason, "session") == 0;
+        heard_voice_ = false;
+        if (session_idle) {
+            audio_.clear();
+            preroll_.clear();
+            frames_ = 0;
+        }
         audio = std::move(audio_);
         frames = frames_;
         sample_rate = sample_rate_;
         frame_ms = frame_ms_;
         audio_.clear();
+        preroll_.clear();
         frames_ = 0;
         clip_id = ++clip_id_;
     }
@@ -511,6 +595,11 @@ ClipResult Session::Finish(const char* reason) {
     if (!BridgeConfigured()) {
         ESP_LOGW(TAG, "Body clip kept local; bridge URL is missing");
         return ClipResult::kNoBridge;
+    }
+    if (session_idle) {
+        QueueEvent("listen_stop", source.c_str(), reason, frames, byte_count, sample_rate, frame_ms,
+                   true, false, clip_id);
+        return ClipResult::kQueued;
     }
 
     bool queued = false;
@@ -543,7 +632,10 @@ void Session::Cancel() {
         }
         capturing_ = false;
         on_stop_ = nullptr;
+        heard_voice_ = false;
+        defer_max_ = false;
         audio_.clear();
+        preroll_.clear();
         frames_ = 0;
     }
     StopTimers();
