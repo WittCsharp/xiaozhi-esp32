@@ -125,7 +125,7 @@ The firmware connects to the official [xiaozhi.me](https://xiaozhi.me) server by
 - [MCP Protocol Interaction Flow](docs/mcp-protocol.md) - Device-side MCP protocol implementation
 - [MQTT + UDP Hybrid Communication Protocol Document](docs/mqtt-udp.md)
 - [A detailed WebSocket communication protocol document](docs/websocket.md)
-- [LAN Control API](docs/lan-control.md) - Play a hosted Ogg Opus file and set emotions from a computer on the same network
+- [LAN Control API](docs/lan-control.md) - Play a hosted Ogg Opus file, or stream Opus/PCM while body mode is on, and set emotions from a computer on the same network
 - [Bot as brain](docs/bot-as-brain.md) - Optional body mode: BOOT uplinks speech to a Mac bridge instead of cloud chat
 
 ## Large Model Configuration

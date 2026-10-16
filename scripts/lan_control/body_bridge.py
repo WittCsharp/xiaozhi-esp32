@@ -27,6 +27,7 @@ from typing import Optional
 
 MAX_BODY_BYTES = 256 * 1024
 MAC_SPEAK = Path(__file__).resolve().parent / "mac_speak.py"
+STREAM_SPEAK = Path(__file__).resolve().parent / "stream_speak.py"
 
 
 def parse_opus_frames(blob: bytes) -> list[bytes]:
@@ -58,6 +59,14 @@ def speak_command(device: str, token: str, text: str, emotion: str = "thinking")
         "--emotion",
         emotion,
     ]
+
+
+def stream_speak_hint(device: str, token: str) -> str:
+    """Command that can push PCM as it is synthesized, instead of a finished Ogg."""
+    return (
+        f"{sys.executable} {STREAM_SPEAK} --device {device} --token {token} "
+        "--codec pcm --sample-rate 24000 --pcm reply.s16le"
+    )
 
 
 def placeholder_text(frame_count: int) -> str:
@@ -93,6 +102,8 @@ def handle_uplink(path: str, headers: dict[str, str], payload: bytes, config: Br
                 ip=event.get("ip", ""),
             )
         )
+        if event.get("event") == "speech_pause":
+            print("[body] speech_pause: clip still open, wait for utterance before replying")
         return 200, {"ok": True}
 
     if route != "/body/audio":
@@ -122,8 +133,10 @@ def handle_uplink(path: str, headers: dict[str, str], payload: bytes, config: Br
             print("[body] speaking reply via mac_speak.py")
             subprocess.run(command, check=False)
         else:
-            print("[body] mac_speak command:")
+            print("[body] mac_speak command (waits for a full Ogg, then /api/notify):")
             print(" ".join(command))
+            print("[body] lower latency: stream Opus or PCM with stream_speak.py")
+            print(stream_speak_hint(config.device, config.token))
     else:
         print("[body] pass --device and --token to print a mac_speak command")
     return 200, {"ok": True, "frames": len(frames), "bytes": len(payload)}

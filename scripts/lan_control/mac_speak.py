@@ -2,8 +2,12 @@
 """Play Mac speech on a Xiaozhi device through the LAN control API.
 
 The device must already be on the same Wi-Fi network, idle, and built with
-CONFIG_LAN_CONTROL_API. This script synthesizes mono Ogg Opus, hosts it, and
-posts the URL. It does not talk to the cloud push API.
+CONFIG_LAN_CONTROL_API. This script synthesizes a finished mono Ogg Opus file,
+hosts it, and posts the URL. The device can play an Ogg response as the bytes
+arrive, but this script does not open the URL until say and ffmpeg have
+finished, so playback waits on the whole file. For body mode, stream Opus or
+PCM with scripts/lan_control/stream_speak.py instead. This does not talk to
+the cloud push API.
 
 See docs/lan-control.md.
 """

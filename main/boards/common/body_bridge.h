@@ -61,6 +61,7 @@ private:
     mutable std::mutex mutex_;
     bool capturing_ = false;
     bool heard_voice_ = false;
+    bool pause_notified_ = false;
     StopCallback on_stop_;
     std::string source_;
     std::vector<uint8_t> audio_;

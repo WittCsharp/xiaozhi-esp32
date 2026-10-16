@@ -2,6 +2,7 @@
 
 #include "application.h"
 #include "body_bridge.h"
+#include "body_downlink.h"
 #include "cjson_utils.h"
 #include "device_state_machine.h"
 #include "lan_control_util.h"
@@ -17,6 +18,10 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#if !defined(CONFIG_HTTPD_WS_SUPPORT) || !defined(CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT)
+#error "CONFIG_LAN_CONTROL_API requires HTTPD_WS_SUPPORT and HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT"
+#endif
 
 namespace {
 
@@ -509,6 +514,253 @@ esp_err_t ServoHandler(httpd_req_t* req) {
     return SendJson(req, "200 OK", response.get());
 }
 
+struct SpeakConn {
+    int fd = -1;
+    uint32_t id = 0;
+    bool started = false;
+    bool pcm = false;
+    bool length_prefixed = false;
+};
+
+SpeakConn g_speak;
+
+void ClearSpeakConn() { g_speak = {}; }
+
+esp_err_t SendWsText(httpd_req_t* req, const char* json) {
+    httpd_ws_frame_t frame = {};
+    frame.type = HTTPD_WS_TYPE_TEXT;
+    frame.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(json));
+    frame.len = std::strlen(json);
+    return httpd_ws_send_frame(req, &frame) == ESP_OK ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t SendWsJson(httpd_req_t* req, cJSON* root) {
+    if (root == nullptr) {
+        return SendWsText(req, "{\"ok\":false,\"error\":\"internal\"}");
+    }
+    CJsonStringUniquePtr printed(cJSON_PrintUnformatted(root));
+    if (!printed) {
+        return SendWsText(req, "{\"ok\":false,\"error\":\"internal\"}");
+    }
+    return SendWsText(req, printed.get());
+}
+
+esp_err_t SpeakFail(httpd_req_t* req, const char* error, const char* state) {
+    CJsonUniquePtr root(cJSON_CreateObject());
+    if (root) {
+        cJSON_AddBoolToObject(root.get(), "ok", false);
+        cJSON_AddStringToObject(root.get(), "error", error != nullptr ? error : "invalid_speak");
+        if (state != nullptr && state[0] != '\0') {
+            cJSON_AddStringToObject(root.get(), "state", state);
+        }
+        SendWsJson(req, root.get());
+    }
+    httpd_ws_frame_t close_frame = {};
+    close_frame.type = HTTPD_WS_TYPE_CLOSE;
+    httpd_ws_send_frame(req, &close_frame);
+    return ESP_OK;
+}
+
+void AbortSpeakConn() {
+    ClearSpeakConn();
+    Application::GetInstance().Schedule([]() { Application::GetInstance().AbortBodySpeak(); });
+}
+
+#if CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
+esp_err_t SpeakPreHandshake(httpd_req_t* req) {
+    esp_err_t result = ESP_OK;
+    if (!RejectUnlessAuthorized(req, result)) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+#endif
+
+bool PushSpeakBytes(const uint8_t* data, size_t size) {
+    if (!g_speak.started || data == nullptr) {
+        return false;
+    }
+    if (g_speak.pcm) {
+        return body_downlink::PushPcm(g_speak.id, data, size);
+    }
+    if (g_speak.length_prefixed) {
+        const uint8_t* cursor = data;
+        size_t left = size;
+        if (left == 0) {
+            return false;
+        }
+        while (left > 0) {
+            body_downlink::OpusView frame;
+            if (!body_downlink::NextLengthPrefixedOpus(cursor, left, frame)) {
+                return false;
+            }
+            if (!body_downlink::PushOpus(g_speak.id, frame.data, frame.size, frame.duration_ms)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    int duration_ms = 0;
+    if (!body_downlink::OpusPacketDurationMs(data, size, duration_ms)) {
+        return false;
+    }
+    return body_downlink::PushOpus(g_speak.id, data, size, duration_ms);
+}
+
+esp_err_t SpeakHandler(httpd_req_t* req) {
+    if (req->method == HTTP_GET) {
+        esp_err_t result = ESP_OK;
+        if (!RejectUnlessAuthorized(req, result)) {
+            return ESP_FAIL;
+        }
+        return ESP_OK;
+    }
+
+    httpd_ws_frame_t ws = {};
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws, 0);
+    const int fd = httpd_req_to_sockfd(req);
+    if (ret != ESP_OK) {
+        if (g_speak.started && fd == g_speak.fd) {
+            const uint32_t id = g_speak.id;
+            ClearSpeakConn();
+            body_downlink::MarkEnded(id);
+        }
+        return ret;
+    }
+    if (!ws.final || ws.len > body_downlink::kMaxBinaryFrame) {
+        if (g_speak.started && fd == g_speak.fd) {
+            AbortSpeakConn();
+        }
+        return SpeakFail(req, "invalid_speak", nullptr);
+    }
+
+    std::vector<uint8_t> payload(ws.len);
+    if (ws.len > 0) {
+        ws.payload = payload.data();
+        ret = httpd_ws_recv_frame(req, &ws, ws.len);
+        if (ret != ESP_OK) {
+            if (g_speak.started && fd == g_speak.fd) {
+                const uint32_t id = g_speak.id;
+                ClearSpeakConn();
+                body_downlink::MarkEnded(id);
+            }
+            return ret;
+        }
+    }
+
+    if (ws.type == HTTPD_WS_TYPE_PING) {
+        httpd_ws_frame_t pong = {};
+        pong.type = HTTPD_WS_TYPE_PONG;
+        pong.payload = payload.empty() ? nullptr : payload.data();
+        pong.len = ws.len;
+        return httpd_ws_send_frame(req, &pong);
+    }
+    if (ws.type == HTTPD_WS_TYPE_PONG) {
+        return ESP_OK;
+    }
+    if (ws.type == HTTPD_WS_TYPE_CLOSE) {
+        if (fd == g_speak.fd && g_speak.started) {
+            const uint32_t id = g_speak.id;
+            ClearSpeakConn();
+            body_downlink::MarkEnded(id);
+        } else if (fd == g_speak.fd) {
+            AbortSpeakConn();
+        }
+        return ESP_OK;
+    }
+
+    if (ws.type == HTTPD_WS_TYPE_TEXT) {
+        const std::string text(
+            payload.empty()
+                ? std::string()
+                : std::string(reinterpret_cast<const char*>(payload.data()), payload.size()));
+        body_downlink::Control control = body_downlink::Control::kStart;
+        body_downlink::Params params;
+        const char* error = "invalid_speak";
+        if (!body_downlink::ParseSpeakJson(text, control, params, error)) {
+            if (g_speak.started && fd == g_speak.fd) {
+                AbortSpeakConn();
+            }
+            return SpeakFail(req, "invalid_speak", nullptr);
+        }
+        if (control == body_downlink::Control::kEnd) {
+            if (!g_speak.started || fd != g_speak.fd) {
+                return SpeakFail(req, "invalid_speak", nullptr);
+            }
+            const uint32_t id = g_speak.id;
+            ClearSpeakConn();
+            body_downlink::MarkEnded(id);
+            CJsonUniquePtr root(cJSON_CreateObject());
+            if (root) {
+                cJSON_AddBoolToObject(root.get(), "ok", true);
+                cJSON_AddStringToObject(root.get(), "event", "ended");
+            }
+            return SendWsJson(req, root.get());
+        }
+        if (control == body_downlink::Control::kAbort) {
+            if (g_speak.started && fd == g_speak.fd) {
+                AbortSpeakConn();
+            }
+            CJsonUniquePtr root(cJSON_CreateObject());
+            if (root) {
+                cJSON_AddBoolToObject(root.get(), "ok", true);
+                cJSON_AddStringToObject(root.get(), "event", "aborted");
+            }
+            return SendWsJson(req, root.get());
+        }
+
+        if (g_speak.started) {
+            const char* state =
+                DeviceStateMachine::GetStateName(Application::GetInstance().GetDeviceState());
+            return SpeakFail(req, "busy", state);
+        }
+        const bool pcm = params.codec == body_downlink::Codec::kPcm;
+        const bool length_prefixed = params.framing == body_downlink::Framing::kLengthPrefixed;
+        const body_downlink::StartResult started = body_downlink::RequestStart(std::move(params));
+        if (started.status != body_downlink::StartStatus::kOk) {
+            const char* state = nullptr;
+            if (started.status == body_downlink::StartStatus::kBusy) {
+                state =
+                    DeviceStateMachine::GetStateName(Application::GetInstance().GetDeviceState());
+            }
+            return SpeakFail(req, started.error != nullptr ? started.error : "busy", state);
+        }
+        g_speak.fd = fd;
+        g_speak.id = started.id;
+        g_speak.started = true;
+        g_speak.pcm = pcm;
+        g_speak.length_prefixed = length_prefixed;
+        CJsonUniquePtr root(cJSON_CreateObject());
+        if (!root) {
+            AbortSpeakConn();
+            return SpeakFail(req, "internal", nullptr);
+        }
+        cJSON_AddBoolToObject(root.get(), "ok", true);
+        cJSON_AddStringToObject(root.get(), "event", "playing");
+        cJSON_AddNumberToObject(root.get(), "playback_id", started.id);
+        ESP_LOGI(TAG, "Speak stream %lu accepted", static_cast<unsigned long>(started.id));
+        return SendWsJson(req, root.get());
+    }
+
+    if (ws.type != HTTPD_WS_TYPE_BINARY) {
+        return SpeakFail(req, "invalid_speak", nullptr);
+    }
+    if (!g_speak.started || fd != g_speak.fd) {
+        if (!g_speak.started) {
+            return SpeakFail(req, "invalid_speak", nullptr);
+        }
+        const char* state =
+            DeviceStateMachine::GetStateName(Application::GetInstance().GetDeviceState());
+        return SpeakFail(req, "busy", state);
+    }
+    if (!PushSpeakBytes(payload.empty() ? nullptr : payload.data(), payload.size())) {
+        ESP_LOGW(TAG, "Speak stream %lu rejected a frame", static_cast<unsigned long>(g_speak.id));
+        AbortSpeakConn();
+        return SpeakFail(req, "invalid_speak", nullptr);
+    }
+    return ESP_OK;
+}
+
 bool RegisterRoute(httpd_handle_t server, const char* uri, httpd_method_t method,
                    esp_err_t (*handler)(httpd_req_t*)) {
     httpd_uri_t route = {
@@ -592,6 +844,19 @@ void LanControlServer::Listen() {
         return;
     }
 
+    httpd_uri_t speak = {};
+    speak.uri = "/api/speak";
+    speak.method = HTTP_GET;
+    speak.handler = SpeakHandler;
+    speak.user_ctx = nullptr;
+#if CONFIG_HTTPD_WS_SUPPORT
+    speak.is_websocket = true;
+    speak.handle_ws_control_frames = true;
+#endif
+#if CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
+    speak.ws_pre_handshake_cb = SpeakPreHandshake;
+#endif
+
     const bool registered = RegisterRoute(server, "/api/health", HTTP_GET, HealthHandler) &&
                             RegisterRoute(server, "/api/notify", HTTP_POST, NotifyHandler) &&
                             RegisterRoute(server, "/api/alert", HTTP_POST, AlertHandler) &&
@@ -599,7 +864,8 @@ void LanControlServer::Listen() {
                             RegisterRoute(server, "/api/mode", HTTP_GET, ModeGetHandler) &&
                             RegisterRoute(server, "/api/mode", HTTP_POST, ModePostHandler) &&
                             RegisterRoute(server, "/api/bridge", HTTP_GET, BridgeGetHandler) &&
-                            RegisterRoute(server, "/api/bridge", HTTP_POST, BridgePostHandler);
+                            RegisterRoute(server, "/api/bridge", HTTP_POST, BridgePostHandler) &&
+                            httpd_register_uri_handler(server, &speak) == ESP_OK;
     if (!registered) {
         httpd_stop(server);
         ESP_LOGE(TAG, "Failed to register LAN control routes");

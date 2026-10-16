@@ -109,6 +109,79 @@ class LanControlScriptTests(unittest.TestCase):
         self.assertEqual(payloads[1]["subtitles"][0]["text"], "Hello")
 
 
+def load_stream_speak():
+    path = ROOT / "scripts" / "lan_control" / "stream_speak.py"
+    spec = importlib.util.spec_from_file_location("stream_speak", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class StreamSpeakTests(unittest.TestCase):
+    def test_frames_round_trip_and_pcm_is_split_before_the_file_ends(self):
+        speak = load_stream_speak()
+        payload = b"opus-packet"
+        mask = b"\x01\x02\x03\x04"
+        encoded = speak.encode_client_frame(0x2, payload, mask)
+        self.assertEqual(encoded[0] & 0x80, 0x80)
+        self.assertEqual(encoded[1] & 0x80, 0x80)
+        decoded = bytes(byte ^ mask[index % 4] for index, byte in enumerate(encoded[6:]))
+        self.assertEqual(decoded, payload)
+
+        server = bytes([0x81, len(b'{"ok":true}')]) + b'{"ok":true}'
+        opcode, body, rest = speak.decode_server_frame(server)
+        self.assertEqual((opcode, body, rest), (0x1, b'{"ok":true}', b""))
+        self.assertIsNone(speak.decode_server_frame(b"\x81"))
+
+        pcm = b"\x00\x01" * 640
+        chunks = speak.split_pcm(pcm, 16000, 20)
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(b"".join(chunks), pcm)
+        packets = speak.iter_length_prefixed(bytes([2, 0, 9, 8, 1, 0, 7]))
+        self.assertEqual(packets, [b"\x09\x08", b"\x07"])
+        self.assertEqual(
+            [speak.length_prefixed_frame(packet) for packet in packets],
+            [bytes([2, 0, 9, 8]), bytes([1, 0, 7])],
+        )
+
+    def test_start_message_and_dry_run_do_not_post_notify(self):
+        speak = load_stream_speak()
+        message = speak.start_message(
+            codec="pcm", sample_rate=24000, text="Hello", emotion="happy"
+        )
+        self.assertEqual(message["codec"], "pcm")
+        self.assertNotIn("audio_url", message)
+        self.assertEqual(message["event"], "start")
+
+        script = ROOT / "scripts" / "lan_control" / "stream_speak.py"
+        ran = subprocess.run(
+            [
+                "python3",
+                str(script),
+                "--device",
+                "http://192.168.1.50:8080",
+                "--token",
+                "secret",
+                "--codec",
+                "opus",
+                "--text",
+                "Hello",
+                "--dry-run",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertNotIn("secret", ran.stdout)
+        self.assertNotIn("/api/notify", ran.stdout)
+        printed = json.loads(ran.stdout.splitlines()[0])
+        self.assertEqual(printed["event"], "start")
+        self.assertEqual(printed["codec"], "opus")
+        self.assertIn("chunks 0", ran.stdout)
+
+
 class LanControlWiringTests(unittest.TestCase):
     def test_routes_use_existing_application_apis(self):
         server = (ROOT / "main" / "boards" / "common" / "lan_control_server.cc").read_text(encoding="utf-8")
@@ -119,8 +192,11 @@ class LanControlWiringTests(unittest.TestCase):
             "/api/servo",
             "/api/mode",
             "/api/bridge",
+            "/api/speak",
         ):
             self.assertIn(route, server)
+        self.assertIn("SpeakHandler", server)
+        self.assertIn("ws_pre_handshake_cb", server)
         self.assertIn("body_mode", server)
         self.assertIn("invalid_mode", server)
         self.assertIn("invalid_bridge", server)
@@ -141,6 +217,9 @@ class LanControlWiringTests(unittest.TestCase):
         self.assertIn('default ""', kconfig)
         self.assertIn("lan_api", kconfig)
         self.assertIn("config BODY_MODE_DEFAULT", kconfig)
+        self.assertIn("HTTPD_WS_SUPPORT", kconfig)
+        self.assertIn("BeginBodySpeak", app)
+        self.assertIn("Ignoring cloud tts in body mode", app)
 
     def test_body_mode_boot_skips_cloud_open(self):
         app = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
@@ -179,6 +258,11 @@ class LanControlWiringTests(unittest.TestCase):
         self.assertIn('kBridgeTokenKey = "bridge_token"', uplink)
         cmake = (ROOT / "main" / "CMakeLists.txt").read_text(encoding="utf-8")
         self.assertIn("body_bridge.cc", cmake)
+        self.assertIn("body_downlink.cc", cmake)
+        uplink_header = (ROOT / "main" / "boards" / "common" / "body_uplink_format.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("kPostSpeechSilenceUs = 600000", uplink_header)
 
 
 def _definition(source, signature):
